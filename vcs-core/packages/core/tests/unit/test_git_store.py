@@ -124,6 +124,50 @@ def test_build_tree_rejects_invalid_filemode_before_pygit2(tmp_path) -> None:
         build_tree(repo, None, [("script.sh", b"#!/bin/sh", 123)])
 
 
+def test_build_tree_drops_a_top_level_dot_git_entry(tmp_path) -> None:
+    """libgit2 refuses a tree entry literally named ".git" (CVE-2014-9390's
+    still-enforced hardening) — a workspace's own .git dir surfacing as a
+    change used to raise pygit2.GitError out of insert_tree_entry; it must
+    now be dropped instead, silently, like git's own worktree scan never
+    yielding .git as trackable content."""
+    repo = pygit2.init_repository(str(tmp_path / "repo"), bare=True)
+    tree_oid = build_tree(
+        repo, None,
+        [("a.py", b"hello"), (".git/config", b"[core]\n"), (".git/HEAD", b"ref: refs/heads/main\n")],
+    )
+    tree = repo.get(tree_oid)
+    assert [e.name for e in tree] == ["a.py"]
+    assert repo.get(tree["a.py"].id).data == b"hello"
+
+
+def test_build_tree_drops_a_nested_dot_git_entry(tmp_path) -> None:
+    """The common real-world case: a git-sourced dependency (an Elixir
+    mix.exs {:git, ...} dep is a typical trigger) plants its own .git
+    several levels under a directory that isn't itself special."""
+    repo = pygit2.init_repository(str(tmp_path / "repo"), bare=True)
+    tree_oid = build_tree(
+        repo, None,
+        [
+            ("deps/some_pkg/mix.exs", b"defmodule; end\n"),
+            ("deps/some_pkg/.git/config", b"[core]\n"),
+        ],
+    )
+    tree = repo.get(tree_oid)
+    some_pkg = repo.get(repo.get(tree["deps"].id)["some_pkg"].id)
+    assert [e.name for e in some_pkg] == ["mix.exs"]
+    assert repo.get(some_pkg["mix.exs"].id).data == b"defmodule; end\n"
+
+
+def test_build_tree_drops_a_dot_git_delete_change_too(tmp_path) -> None:
+    """A delete change under .git must be dropped the same way an insert is
+    — it can never have been legitimately present in a prior tree either,
+    since inserting it would have raised at that point too."""
+    repo = pygit2.init_repository(str(tmp_path / "repo"), bare=True)
+    tree_oid = build_tree(repo, None, [(".git/config", None), ("a.py", b"hello")])
+    tree = repo.get(tree_oid)
+    assert [e.name for e in tree] == ["a.py"]
+
+
 @pytest.fixture
 def _clean_recovery_counter():
     reset_loose_object_recovery_counter()

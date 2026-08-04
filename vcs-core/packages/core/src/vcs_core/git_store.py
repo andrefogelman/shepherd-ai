@@ -183,6 +183,20 @@ def _unpack_change(change: WorkspaceChange) -> tuple[str, bytes | None, int]:
     return path, content, mode
 
 
+# libgit2's own TreeBuilder.insert refuses a path component literally named
+# ".git" (case-insensitively) — the CVE-2014-9390 hardening, still enforced
+# today. A workspace's own .git directory, or a nested one from a project's
+# git-sourced dependency (e.g. an Elixir `mix.exs` {:git, ...} dep checked
+# out under deps/<pkg>/.git), surfaces here whenever it gets swept up as a
+# workspace change to snapshot — insert_tree_entry then raises. .git is VCS
+# infrastructure, never trackable workspace content: a real git worktree
+# scan never yields it as trackable content either, so build_tree drops any
+# change under such a component before ever building a blob/subtree for it,
+# rather than letting the insert fail.
+def _has_reserved_git_component(path: str) -> bool:
+    return any(part.casefold() == ".git" for part in path.split("/"))
+
+
 def build_tree(
     repo: pygit2.Repository,
     parent_tree_oid: pygit2.Oid | None,
@@ -202,6 +216,8 @@ def build_tree(
 
     for change in changes:
         path, content, mode = _unpack_change(change)
+        if _has_reserved_git_component(path):
+            continue
         if "/" in path:
             parts = path.split("/", 1)
             rest: WorkspaceChange = (
