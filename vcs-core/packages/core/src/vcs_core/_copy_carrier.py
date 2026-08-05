@@ -250,6 +250,25 @@ class CopyCarrierBackend:
             if stat.S_ISREG(file_stat.st_mode):
                 files[rel] = (candidate.read_bytes(), posix_to_git_mode(file_stat.st_mode))
                 continue
+            if stat.S_ISLNK(file_stat.st_mode):
+                # Symlinks are ordinary in real trees — an Elixir project's
+                # _build is full of them, so is node_modules/.bin — and
+                # _copy_scope_dir already copies them through deliberately
+                # (`copytree(..., symlinks=True)`). Raising here refused the
+                # very entries this carrier had just chosen to preserve, so a
+                # normal `mix` build was enough to fail a scan.
+                #
+                # They are skipped rather than represented: a diff of
+                # (bytes, git-mode) pairs has no way to express a link, and
+                # inventing one would be a bigger change than this floor
+                # warrants. Consequence, stated plainly: a symlink CREATED by
+                # a run is not captured in its changeset — the same shape of
+                # documented gap this carrier already has elsewhere.
+                #
+                # The genuinely exotic kinds below still raise. A fifo,
+                # socket or device node in a workspace means something is
+                # wrong that a silent skip would hide; a symlink does not.
+                continue
             kind = unsupported_overlay_entry_kind(file_stat.st_mode) or "unsupported"
             raise UnsupportedOverlayEntryError(path=rel, kind=kind)
         return files
