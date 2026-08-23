@@ -53,7 +53,6 @@ pythonpath = ["src", "tests"]
 addopts = ["-q", "-m", "not container"]
 markers = [
     "container: needs Linux kernel features (Landlock, fuse-overlayfs); run via `make test_container` in vcs-core/packages/core",
-    "workspace_component: fast workspace-control unit/component tests with no real retained-run workspace",
     "workspace_smoke: minimal real workspace-control canaries for the local fast lane",
     "workspace_native_jail: workspace-control tests that require a proven native syscall jail",
     "slow: expensive /workspace-control scenario tests excluded from fast local dialect checks",

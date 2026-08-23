@@ -347,14 +347,6 @@ class TestDeviceContextCleanup:
             # Sandbox should be removed from tracking even if cleanup fails
             assert "failing-sandbox" not in sandboxes
 
-    @pytest.mark.skip(reason="Device nesting is now prohibited - see test_device_context_nested_raises_error")
-    def test_device_context_cleans_nested_device_sandboxes_independently(self):
-        """Nested Device contexts should clean their own sandboxes.
-
-        NOTE: This test is skipped because Device nesting is now prohibited.
-        The test_device_context_nested_raises_error test verifies this behavior.
-        """
-
     def test_device_context_uses_discard_if_no_cleanup(self):
         """Device context should use discard() if cleanup() is not available."""
         from shepherd_runtime.scope import Scope

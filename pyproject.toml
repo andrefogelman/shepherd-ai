@@ -47,6 +47,7 @@ members = [
     "vcs-core/extras/*",
     "commons-vcs",
 ]
+exclude = ["shepherd/packages/__pycache__"]
 
 [tool.uv.sources]
 shepherd = { workspace = true }
@@ -80,10 +81,6 @@ exclude = [
     "^shepherd/packages/kernel-v3-reference/src/shepherd_kernel_v3_reference/spikes/",
     "^src/shepherd_kernel_v3_reference/spikes/",
 ]
-
-[[tool.mypy.overrides]]
-module = "shepherd_core.export.atif"
-warn_unused_ignores = false
 
 [[tool.mypy.overrides]]
 module = "shepherd_export.atif"

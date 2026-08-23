@@ -211,7 +211,11 @@ class Workspace:
         self.root = root
         self.trace_store_path = root / ".vcscore" / "shepherd" / "trace.sqlite"
         store = Store(str(root / ".vcscore"))
-        ctx = build_builtin_substrate_context(store, workspace=root, config={"backend": "clonefile"})
+        # No pinned backend: auto-detection applies the platform pairing (native
+        # kernel/FUSE overlay on Linux, APFS clonefile on macOS, copy floor
+        # everywhere else). The previous hard "clonefile" pin made every
+        # Workspace-backed run raise on Linux even with a working overlay.
+        ctx = build_builtin_substrate_context(store, workspace=root)
         self._mg = VcsCore(
             str(root),
             substrates=[
