@@ -8,6 +8,7 @@ materialization to the real workspace. macOS-gated (APFS clonefile; Linux uses f
 
 from __future__ import annotations
 
+import os
 import sys
 
 import pytest
@@ -94,15 +95,31 @@ def test_clonefile_push_materializes_diff_to_real_workspace(tmp_path) -> None:
 
 
 @_macos
-def test_clonefile_diff_rejects_symlinks(tmp_path) -> None:
-    """Symlinks are unsupported, consistent with the overlay backends' diff_layer
-    (test_diff_layer_rejects_symlink_entries): a symlink in a scope surfaces as
-    UnsupportedOverlayEntryError at diff time, never silently skipped or mis-captured."""
+def test_clonefile_diff_skips_symlinks(tmp_path) -> None:
+    """`ClonefileCarrierBackend` HERDA de `CopyCarrierBackend`, então herda também
+    o `_scan_dir` que pula symlink em vez de recusá-lo. Este teste existe para
+    dizer isso explicitamente: quando o comportamento do pai mudou, este arquivo
+    continuou afirmando o contrato antigo e ficou vermelho sem ninguém olhar.
+
+    A perda é a mesma do carrier de cópia: um symlink criado durante um run NÃO
+    entra no changeset."""
+    backend = _make(tmp_path)
+    backend.create_layer("ground", parent_scope_id=None)
+    (backend.working_path("ground") / "link").symlink_to("a.txt")
+    backend.write_file("ground", "c.txt", b"C")
+
+    diff = {path: (content, mode) for path, content, mode in backend.diff_layer("ground")}
+    assert diff == {"c.txt": (b"C", 0o100644)}
+
+
+@_macos
+def test_clonefile_diff_still_rejects_exotic_kinds(tmp_path) -> None:
+    """Fifo, socket e device continuam levantando — o skip vale só para symlink."""
     from vcs_core import UnsupportedOverlayEntryError
 
     backend = _make(tmp_path)
     backend.create_layer("ground", parent_scope_id=None)
-    (backend.working_path("ground") / "link").symlink_to("a.txt")
+    os.mkfifo(backend.working_path("ground") / "pipe")
     with pytest.raises(UnsupportedOverlayEntryError):
         backend.diff_layer("ground")
 

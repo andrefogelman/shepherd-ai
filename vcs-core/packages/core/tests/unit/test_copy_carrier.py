@@ -4,12 +4,15 @@
 Backend-level coverage mirroring ``test_clonefile_carrier.py`` but WITHOUT the
 macOS gate: a plain recursive copy of the base, copy-vs-base diff (add/modify/
 delete + exec bit), child-scope parent-relative diff + commit-into-parent,
-discard, push materialization, symlink rejection, and the unmaterialized-parent
+discard, push materialization, symlink skipping (exotic kinds still rejected),
+and the unmaterialized-parent
 / missing-destination regressions. Runs on every platform (macOS, Linux, WSL) —
 the same contract the overlay and clonefile carriers satisfy.
 """
 
 from __future__ import annotations
+
+import os
 
 import pytest
 from vcs_core._copy_carrier import CopyCarrierBackend
@@ -84,15 +87,33 @@ def test_copy_push_materializes_diff_to_real_workspace(tmp_path) -> None:
     assert backend.diff_layer("ground") == []  # ground reset to base after push
 
 
-def test_copy_diff_rejects_symlinks(tmp_path) -> None:
-    """Symlinks are unsupported, consistent with the overlay and clonefile carriers:
-    a symlink in a scope surfaces as UnsupportedOverlayEntryError at diff time,
-    never silently skipped or mis-captured."""
+def test_copy_diff_skips_symlinks(tmp_path) -> None:
+    """A symlink is skipped, not refused: `_copy_scope_dir` copies links through
+    deliberately (`copytree(..., symlinks=True)`), and raising here refused the
+    very entries the carrier had just chosen to keep — an Elixir `_build` or a
+    `node_modules/.bin` was enough to fail an ordinary scan.
+
+    Stated plainly, because it is a real loss: a symlink created during a run is
+    NOT captured in its changeset. A diff of (bytes, git-mode) pairs has no way
+    to express a link."""
+    backend = _make(tmp_path)
+    backend.create_layer("ground", parent_scope_id=None)
+    (backend.working_path("ground") / "link").symlink_to("a.txt")
+    backend.write_file("ground", "c.txt", b"C")  # uma mudança de verdade junto
+
+    diff = {path: (content, mode) for path, content, mode in backend.diff_layer("ground")}
+    assert diff == {"c.txt": (b"C", 0o100644)}  # o link não entra, e nada mais quebra
+
+
+def test_copy_diff_still_rejects_exotic_kinds(tmp_path) -> None:
+    """O skip vale SÓ para symlink. Fifo, socket e device continuam levantando:
+    um deles no workspace quer dizer que algo está errado, e um skip silencioso
+    esconderia isso."""
     from vcs_core import UnsupportedOverlayEntryError
 
     backend = _make(tmp_path)
     backend.create_layer("ground", parent_scope_id=None)
-    (backend.working_path("ground") / "link").symlink_to("a.txt")
+    os.mkfifo(backend.working_path("ground") / "pipe")
     with pytest.raises(UnsupportedOverlayEntryError):
         backend.diff_layer("ground")
 
