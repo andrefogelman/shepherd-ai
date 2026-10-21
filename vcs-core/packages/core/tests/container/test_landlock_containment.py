@@ -13,6 +13,7 @@ import json
 import os
 import shutil
 import socket
+import subprocess
 import sys
 from pathlib import Path
 
@@ -659,22 +660,43 @@ def test_landlock_reports_a_reachable_x_display(tmp_path, monkeypatch, fresh_hid
     assert "keystrokes" in (landlock.exposure() or "")
 
 
-def test_landlock_reports_ssh_to_loopback_only_with_a_key_that_logs_in(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(landlock.Path, "home", classmethod(lambda cls: tmp_path))
-    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+def test_landlock_reports_ssh_to_loopback_only_when_the_login_succeeds(monkeypatch) -> None:
+    """Keys on disk and an sshd on loopback are not enough: the check logs in and runs `true`."""
+    monkeypatch.setattr(landlock, "_SSH_LOGS_IN", None)
+    monkeypatch.setattr(landlock.shutil, "which", lambda name: "/usr/bin/ssh" if name == "ssh" else None)
     monkeypatch.setattr(landlock.socket, "create_connection", lambda address, timeout: socket.socket())
-    ssh = tmp_path / ".ssh"
-    ssh.mkdir()
-    (ssh / "id_ed25519").write_text("")
-    assert landlock._loopback_ssh() is False  # no authorized_keys: the key does not log in here
-    (ssh / "authorized_keys").write_text("")
+    runs: list[list[str]] = []
+
+    def login(rc):
+        def run(argv, **kwargs):
+            runs.append(argv)
+            return subprocess.CompletedProcess(argv, rc, b"", b"")
+
+        return run
+
+    monkeypatch.setattr(landlock.subprocess, "run", login(255))
+    assert landlock._loopback_ssh() is False  # denied: Permission denied (publickey)
+    argv = runs[0]
+    assert argv[-2:] == ["127.0.0.1", "true"]
+    assert "BatchMode=yes" in argv
+    assert "UserKnownHostsFile=/dev/null" in argv
+    tries = len(runs)
+    assert landlock._loopback_ssh() is False
+    assert len(runs) == tries  # once per process
+
+    monkeypatch.setattr(landlock, "_SSH_LOGS_IN", None)
+    monkeypatch.setattr(landlock.subprocess, "run", login(0))
     assert landlock._loopback_ssh() is True
+    assert "logged in to sshd" in (landlock.exposure() or "")
 
     def refused(address, timeout):
         raise ConnectionRefusedError
 
+    monkeypatch.setattr(landlock, "_SSH_LOGS_IN", None)
     monkeypatch.setattr(landlock.socket, "create_connection", refused)
-    assert landlock._loopback_ssh() is False  # no sshd on loopback
+    runs.clear()
+    assert landlock._loopback_ssh() is False  # no sshd on loopback: no login tried
+    assert runs == []
 
 
 def test_landlock_masks_a_socket_inside_a_bound_back_path(tmp_path, monkeypatch, fresh_hiding) -> None:

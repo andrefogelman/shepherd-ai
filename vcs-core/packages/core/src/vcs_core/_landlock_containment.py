@@ -86,6 +86,9 @@ _X11_DIR = "/tmp/.X11-unix"
 #: The (hidden directories, kept paths) whose kept paths the probe has walked inside the
 #: jail in this process; later probes check only the masked sockets.
 _KEPT_WALKED: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
+# The loopback ssh login is tried once per process: exposure() runs again on launches
+# where hiding fails, and each try is a login in the host's auth log.
+_SSH_LOGS_IN: bool | None = None
 
 
 class JailExposureWarning(RuntimeWarning):
@@ -506,19 +509,34 @@ def _x_displays() -> tuple[str, ...]:
 
 
 def _loopback_ssh() -> bool:
-    """True when sshd answers on loopback and this user's key or agent can log in to it."""
-    ssh = Path.home() / ".ssh"
-    if not (ssh / "authorized_keys").exists():
+    """True when this user logs in to sshd on loopback without a prompt.
+
+    Measured by logging in and running `true`: which keys sshd accepts can depend on
+    configuration only root reads (AuthorizedKeysFile, Match, AllowUsers).
+    """
+    global _SSH_LOGS_IN
+    if _SSH_LOGS_IN is None:
+        _SSH_LOGS_IN = any(_ssh_logs_in(host) for host in ("127.0.0.1", "::1"))
+    return _SSH_LOGS_IN
+
+
+def _ssh_logs_in(host: str) -> bool:
+    ssh = shutil.which("ssh")
+    if ssh is None:
         return False
-    if not os.environ.get("SSH_AUTH_SOCK") and not any(p.suffix != ".pub" for p in ssh.glob("id_*")):
+    try:
+        socket.create_connection((host, 22), timeout=0.2).close()
+    except OSError:
         return False
-    for host in ("127.0.0.1", "::1"):
-        try:
-            socket.create_connection((host, 22), timeout=0.2).close()
-        except OSError:
-            continue
-        return True
-    return False
+    argv = [ssh, "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", "-o", "LogLevel=ERROR"]
+    # nothing written to the user's known_hosts by this check
+    argv += ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"]
+    argv += ["-o", "GlobalKnownHostsFile=/dev/null", "-l", pwd.getpwuid(os.getuid()).pw_name, host, "true"]
+    try:
+        done = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return done.returncode == 0
 
 
 def exposure() -> str | None:
@@ -573,7 +591,7 @@ def exposure() -> str | None:
         )
     if _loopback_ssh():
         parts.append(
-            "sshd answers on this host's loopback and this user's ssh key or agent can log in to it: `ssh "
+            "this user logged in to sshd on this host's loopback without a prompt: `ssh "
             "localhost cmd` from inside the jail runs cmd outside it. The jail does not govern network "
             "connections; run where sshd does not accept this user's key to close this."
         )
