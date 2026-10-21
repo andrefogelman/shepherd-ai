@@ -16,7 +16,9 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import pwd
 import shutil
+import stat
 import subprocess
 import sys
 import warnings
@@ -52,11 +54,16 @@ _WRITE_FILE = 1 << 1
 #: Landlock (below ABI 6) does not govern connecting to a socket by path. The user's
 #: runtime directory holds the session bus and systemd's private socket, so a confined
 #: command could run `systemd-run --user -- cmd`: the service manager starts cmd as its own
-#: child, outside this process tree, and the jail never applies to it. Where such a socket
-#: exists and bubblewrap works, bubblewrap mounts an empty tmpfs over the directory before
+#: child, outside this process tree, and the jail never applies to it. tmux and screen
+#: servers do the same for `tmux new-window cmd` and `screen -X`. Where such a socket
+#: directory exists and bubblewrap works, bubblewrap mounts an empty tmpfs over it before
 #: the runner confines itself. Where bubblewrap is missing or cannot start, the launch
-#: still runs, with that door open, and `service_manager_exposure` says so.
+#: still runs, with that door open, and `exposure` says so.
 _SERVICE_MANAGER_SOCKETS = ("bus", "systemd/private")
+
+#: A trial bubblewrap run that takes longer than this counts as one that cannot start:
+#: it runs before the first launch, and a hang there would hold the caller indefinitely.
+_TRIAL_TIMEOUT_S = 10
 
 #: Commands that wrap every launch from outside the jail (see `set_outer_prefix`).
 _OUTER_PREFIX: list[str] = []
@@ -64,6 +71,15 @@ _OUTER_PREFIX: list[str] = []
 #: Whether bubblewrap could hide each tuple of directories, keyed by that tuple. Decided
 #: once per process: a trial run costs a namespace setup on every launch otherwise.
 _HIDING_WORKS: dict[tuple[str, ...], str | None] = {}
+
+
+class JailExposureWarning(RuntimeWarning):
+    """Raised per launch while the jail cannot hide the command servers' sockets.
+
+    The reason is decided once per process, so every warning of a process repeats the
+    same text; a caller that already showed `exposure()` can filter this category.
+    """
+
 
 _RUNNER_SENTINEL = "__landlock_confine_exec__"
 _CONFINE_FAILED_RC = 3  # runner exit code when confinement could not be established (touch never uses 3)
@@ -182,20 +198,79 @@ def _service_manager_dirs() -> tuple[str, ...]:
     return tuple(found)
 
 
+def _terminal_server_dirs() -> tuple[str, ...]:
+    """This user's tmux and screen socket directories that exist."""
+    uid = os.getuid()
+    try:
+        user = pwd.getpwuid(uid).pw_name
+    except KeyError:
+        user = ""
+    candidates = [str(Path(os.environ.get("TMUX_TMPDIR") or "/tmp") / f"tmux-{uid}")]
+    if os.environ.get("SCREENDIR"):
+        candidates.append(os.environ["SCREENDIR"])
+    if user:
+        candidates += [f"/run/screen/S-{user}", f"/var/run/screen/S-{user}"]
+    found: list[str] = []
+    for candidate in candidates:
+        real = os.path.realpath(candidate)
+        if real not in found and Path(real).is_dir():
+            found.append(real)
+    return tuple(found)
+
+
+def _hidden_dirs() -> tuple[str, ...]:
+    """Every directory the jail hides: the service manager's, then tmux's and screen's."""
+    found = list(_service_manager_dirs())
+    for extra in _terminal_server_dirs():
+        if extra not in found:
+            found.append(extra)
+    return tuple(found)
+
+
 def _find_bwrap() -> str | None:
     return shutil.which("bwrap")
 
 
-def _bwrap_argv(bwrap: str, dirs: Sequence[str]) -> list[str]:
-    """Bubblewrap argv that keeps the host view and mounts an empty tmpfs over ``dirs``."""
+def _bwrap_argv(bwrap: str, dirs: Sequence[str], keep: Sequence[str] = ()) -> list[str]:
+    """Bubblewrap argv that keeps the host view and mounts an empty tmpfs over ``dirs``.
+
+    A path in ``keep`` that falls under a hidden directory (a workspace or writable root
+    under the runtime directory, for one) is bound back on top of the tmpfs, so the
+    command still finds it. Writes there stay governed by the Landlock ruleset.
+    """
     argv = [bwrap, "--bind", "/", "/", "--dev-bind", "/dev", "/dev", "--proc", "/proc"]
     for hidden in dirs:
         argv += ["--tmpfs", hidden]
+    for path in dict.fromkeys(os.path.realpath(p) for p in keep):
+        if any(Path(path).is_relative_to(hidden) for hidden in dirs):
+            argv += ["--bind", path, path]
     return [*argv, "--die-with-parent", "--"]
 
 
-#: Exits 1 when any directory given is not empty.
-_EMPTY_DIRS_CHECK = "import os, sys; sys.exit(1 if any(os.listdir(d) for d in sys.argv[1:]) else 0)"
+#: Exits 1 when a hidden directory holds anything besides the entries leading to a path
+#: bound back into it. argv[1] is JSON: [[directory, [allowed entry, ...]], ...].
+_HIDDEN_DIRS_CHECK = (
+    "import json, os, sys; sys.exit(1 if any(set(os.listdir(d)) - set(a) for d, a in json.loads(sys.argv[1])) else 0)"
+)
+
+
+def _hidden_dirs_spec(dirs: Sequence[str], keep: Sequence[str] = ()) -> str:
+    """The `_HIDDEN_DIRS_CHECK` argument for ``dirs``.
+
+    Each directory goes with the first component of every kept path under it: the only
+    entries allowed to show inside the jail.
+    """
+    spec = []
+    for hidden in dirs:
+        allowed = sorted(
+            {
+                Path(os.path.realpath(p)).relative_to(hidden).parts[0]
+                for p in keep
+                if Path(os.path.realpath(p)).is_relative_to(hidden) and Path(os.path.realpath(p)) != Path(hidden)
+            }
+        )
+        spec.append([hidden, allowed])
+    return json.dumps(spec)
 
 
 def _why_not_hidden(dirs: tuple[str, ...]) -> str | None:
@@ -205,50 +280,86 @@ def _why_not_hidden(dirs: tuple[str, ...]) -> str | None:
         if bwrap is None:
             reason: str | None = "bubblewrap (bwrap) is not installed"
         else:
-            trial = subprocess.run(
-                [*_bwrap_argv(bwrap, dirs), sys.executable, "-c", _EMPTY_DIRS_CHECK, *dirs],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            detail = (trial.stderr or trial.stdout).strip()
-            reason = None if trial.returncode == 0 else f"bubblewrap could not hide them ({detail or trial.returncode})"
+            try:
+                trial = subprocess.run(
+                    [*_bwrap_argv(bwrap, dirs), sys.executable, "-c", _HIDDEN_DIRS_CHECK, _hidden_dirs_spec(dirs)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=_TRIAL_TIMEOUT_S,
+                )
+            except subprocess.TimeoutExpired:
+                reason = f"bubblewrap did not finish a trial run within {_TRIAL_TIMEOUT_S} s"
+            else:
+                detail = (trial.stderr or trial.stdout).strip()
+                reason = (
+                    None if trial.returncode == 0 else f"bubblewrap could not hide them ({detail or trial.returncode})"
+                )
         _HIDING_WORKS[dirs] = reason
     return _HIDING_WORKS[dirs]
 
 
-def service_manager_exposure() -> str | None:
-    """A message for the user when the jail leaves the service manager reachable, else None.
+def _docker_sockets(hidden: Sequence[str]) -> tuple[str, ...]:
+    """Docker daemon sockets this user can write to and the jail does not hide."""
+    candidates = ["/var/run/docker.sock", "/run/docker.sock"]
+    host = os.environ.get("DOCKER_HOST", "")
+    if host.startswith("unix://"):
+        candidates.insert(0, host[len("unix://") :])
+    found: list[str] = []
+    for candidate in candidates:
+        real = os.path.realpath(candidate)
+        if real in found or any(Path(real).is_relative_to(h) for h in hidden):
+            continue
+        with suppress(OSError):
+            if stat.S_ISSOCK(Path(real).stat().st_mode) and os.access(real, os.W_OK):
+                found.append(real)
+    return tuple(found)
 
-    Reachable means a confined command can start processes outside the jail. The message
-    names the directories, the reason, and how to close it.
+
+def exposure() -> str | None:
+    """A message for the user when the jail leaves a command server reachable, else None.
+
+    Reachable means a confined command can have a process started outside the jail. The
+    message names the paths, the reason, and how to close each one.
     """
-    dirs = _service_manager_dirs()
-    if not dirs:
-        return None
-    reason = _why_not_hidden(dirs)
-    if reason is None:
-        return None
-    return (
-        f"the jail does not hide the user's service manager: {', '.join(dirs)} holds its socket and "
-        f"{reason}. A confined command can start processes outside the jail with `systemd-run --user`, "
-        "so its writes are no longer confined. Install bubblewrap to close this (Debian/Ubuntu: "
-        "`sudo apt install bubblewrap`; Fedora: `sudo dnf install bubblewrap`); where AppArmor restricts "
-        "unprivileged user namespaces (Ubuntu 23.10 and later), bwrap also needs the profile that allows them. "
-        "Running without this protection."
-    )
+    parts: list[str] = []
+    dirs = _hidden_dirs()
+    reason = _why_not_hidden(dirs) if dirs else None
+    if reason is not None:
+        parts.append(
+            f"the jail does not hide {', '.join(dirs)}, which hold sockets of servers that run commands for "
+            f"this user (the service manager, tmux, screen), and {reason}. A confined command can start "
+            "processes outside the jail through them (`systemd-run --user`, `tmux new-window`), so its writes "
+            "are no longer confined. Install bubblewrap to close this (Debian/Ubuntu: "
+            "`sudo apt install bubblewrap`; Fedora: `sudo dnf install bubblewrap`); where AppArmor restricts "
+            "unprivileged user namespaces (Ubuntu 23.10 and later), bwrap also needs the profile that allows "
+            "them. Running without this protection."
+        )
+    hidden = dirs if reason is None else ()
+    for sock in _docker_sockets(hidden):
+        parts.append(
+            f"{sock} is writable by this user: a confined command can drive the Docker daemon, which runs as "
+            "root, and escape the jail through it. The jail does not hide it; remove the user from the docker "
+            "group, or run where the socket is not writable, to close this."
+        )
+    return " Also: ".join(parts) if parts else None
 
 
-def _hiding_argv() -> list[str]:
+def service_manager_exposure() -> str | None:
+    """Same as `exposure` (the 0.3.6 name)."""
+    return exposure()
+
+
+def _hiding_argv(keep: Sequence[str] = ()) -> list[str]:
     """The bubblewrap prefix for this launch, or [] when nothing needs or can be hidden."""
-    dirs = _service_manager_dirs()
+    dirs = _hidden_dirs()
     if not dirs:
         return []
     bwrap = _find_bwrap()
     if bwrap is None or _why_not_hidden(dirs) is not None:
-        warnings.warn(service_manager_exposure() or "", RuntimeWarning, stacklevel=3)
+        warnings.warn(exposure() or "", JailExposureWarning, stacklevel=3)
         return []
-    return _bwrap_argv(bwrap, dirs)
+    return _bwrap_argv(bwrap, dirs, keep)
 
 
 class LandlockContainmentBackend:
@@ -279,17 +390,26 @@ class LandlockContainmentBackend:
         return json.dumps([os.path.realpath(str(root)) for root in writable_roots])
 
     def launch(
-        self, profile: str, working_root: Any, command: list[str], *, env: dict[str, str] | None = None
+        self,
+        profile: str,
+        working_root: Any,
+        command: list[str],
+        *,
+        env: dict[str, str] | None = None,
+        outer: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         """Run command under a Landlock confine-then-exec runner (this module's ``__main__``).
 
-        Order, outermost first: the outer prefix, bubblewrap hiding the service-manager
-        sockets (where one exists and bubblewrap works), the runner, the command.
+        Order, outermost first: the outer prefix (unless ``outer`` is False), bubblewrap
+        hiding the command servers' sockets (where one exists and bubblewrap works), the
+        runner, the command. The probe passes ``outer=False``: its launches only touch a
+        file, and a wrapper failing there would read as a denied write.
         """
+        cwd = os.path.realpath(str(working_root))
         return subprocess.run(
             [
-                *_OUTER_PREFIX,
-                *_hiding_argv(),
+                *(_OUTER_PREFIX if outer else ()),
+                *_hiding_argv((cwd, *json.loads(profile or "[]"))),
                 sys.executable,
                 "-m",
                 "vcs_core._landlock_containment",
@@ -297,7 +417,7 @@ class LandlockContainmentBackend:
                 profile,
                 *command,
             ],
-            cwd=os.path.realpath(str(working_root)),
+            cwd=cwd,
             env=env if env is not None else dict(os.environ),
             capture_output=True,
             text=True,
@@ -311,7 +431,7 @@ class LandlockContainmentBackend:
         """
         with suppress(FileNotFoundError):
             target.unlink()
-        rc = self.launch(profile, working_root, ["/usr/bin/touch", "--", str(target)]).returncode
+        rc = self.launch(profile, working_root, ["/usr/bin/touch", "--", str(target)], outer=False).returncode
         with suppress(FileNotFoundError):
             target.unlink()
         return rc
@@ -320,7 +440,7 @@ class LandlockContainmentBackend:
         """Fail-closed (§6): prove the jail is BOTH live AND grant-conformant before the body.
 
         Deny-closed and per-root, mirroring the Seatbelt probe: (0) where bubblewrap hides
-        the service-manager sockets, they are not reachable inside the jail; (1) an out-of-WORKSPACE write
+        the command servers' sockets, they are not reachable inside the jail; (1) an out-of-WORKSPACE write
         is denied; (2) a write beneath each declared writable root is allowed; (3) if WORKDIR
         is not itself a writable root, an in-WORKDIR write outside every root is denied.
 
@@ -339,16 +459,22 @@ class LandlockContainmentBackend:
 
         # (0) where hiding is in effect, check it inside the real jail. Runs first: a
         # bubblewrap that failed to start exits non-zero, which step (1) would read as a
-        # denied write. Where hiding is not possible, `service_manager_exposure` reports it.
-        hidden = _service_manager_dirs()
+        # denied write. Where hiding is not possible, `exposure` reports it.
+        hidden = _hidden_dirs()
         if hidden and _why_not_hidden(hidden) is None:
-            done = self.launch(profile, working_root, [sys.executable, "-c", _EMPTY_DIRS_CHECK, *hidden])
+            kept = (str(wd), *json.loads(profile or "[]"))
+            done = self.launch(
+                profile,
+                working_root,
+                [sys.executable, "-c", _HIDDEN_DIRS_CHECK, _hidden_dirs_spec(hidden, kept)],
+                outer=False,
+            )
             if done.returncode == _CONFINE_FAILED_RC:
                 raise JailNotEstablished("fail-closed: Landlock confinement could not be established")
             if done.returncode != 0:
                 detail = (done.stderr or done.stdout).strip()
                 raise JailNotEstablished(
-                    f"fail-closed: the service-manager socket is reachable inside the jail ({detail})"
+                    f"fail-closed: a command server's socket is reachable inside the jail ({detail})"
                 )
 
         # (1) liveness: a write OUTSIDE the workspace must be denied.

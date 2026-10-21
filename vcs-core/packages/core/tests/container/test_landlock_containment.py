@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import sys
 from pathlib import Path
 
@@ -225,12 +226,112 @@ def test_landlock_runs_with_a_warning_when_bwrap_cannot_start(tmp_path, monkeypa
 
 
 def test_landlock_reports_no_exposure_when_hidden_or_absent(monkeypatch, fresh_hiding) -> None:
+    monkeypatch.setattr(landlock, "_docker_sockets", lambda hidden: ())
     if _user_bus_dir() is not None and shutil.which("bwrap") is not None:
-        assert landlock.service_manager_exposure() is None
-    monkeypatch.setattr(landlock, "_service_manager_dirs", lambda: ())
+        assert landlock.exposure() is None
+    monkeypatch.setattr(landlock, "_hidden_dirs", lambda: ())
     monkeypatch.setattr(landlock, "_find_bwrap", lambda: None)
+    assert landlock.exposure() is None
     assert landlock.service_manager_exposure() is None
     assert landlock._hiding_argv() == []
+
+
+def _needs_bwrap() -> None:
+    if shutil.which("bwrap") is None:
+        pytest.skip("bubblewrap is not installed")
+
+
+def test_landlock_hides_the_tmux_socket_directory(tmp_path, monkeypatch, fresh_hiding) -> None:
+    """`tmux new-window cmd` runs cmd under the tmux server, outside the jail, like systemd-run."""
+    _needs_bwrap()
+    tmux_tmp = tmp_path / "tmuxtmp"
+    tmux_dir = tmux_tmp / f"tmux-{os.getuid()}"
+    tmux_dir.mkdir(parents=True)
+    (tmux_dir / "default").write_text("")
+    monkeypatch.setenv("TMUX_TMPDIR", str(tmux_tmp))
+    work = tmp_path / "work"
+    work.mkdir()
+    backend = LandlockContainmentBackend()
+    profile = backend.profile_for((str(work),), allow_network=True)
+    done = backend.launch(
+        profile, work, [sys.executable, "-c", "import os, sys; print(os.listdir(sys.argv[1]))", str(tmux_dir)]
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "[]"
+
+
+def test_landlock_keeps_a_workspace_that_sits_under_a_hidden_directory(tmp_path, monkeypatch, fresh_hiding) -> None:
+    """A writable root under a hidden directory is bound back over the tmpfs: its writes
+    land on the host instead of vanishing into the mask, and siblings stay hidden."""
+    _needs_bwrap()
+    tmux_tmp = tmp_path / "tmuxtmp"
+    hidden = tmux_tmp / f"tmux-{os.getuid()}"
+    work = hidden / "work"
+    work.mkdir(parents=True)
+    (hidden / "default").write_text("")
+    monkeypatch.setenv("TMUX_TMPDIR", str(tmux_tmp))
+    backend = LandlockContainmentBackend()
+    profile = backend.profile_for((str(work),), allow_network=True)
+    backend.probe(profile, work, writable_roots=(str(work),))
+    done = backend.launch(
+        profile,
+        work,
+        ["/bin/sh", "-c", 'touch -- "$1/made" && ls -A -- "$2"', "sh", str(work), str(hidden)],
+    )
+    assert done.returncode == 0, done.stderr
+    assert (work / "made").exists()
+    assert done.stdout.split() == ["work"]  # the socket beside it is not visible
+
+
+def test_landlock_warns_with_its_own_category(tmp_path, monkeypatch, fresh_hiding) -> None:
+    """Callers that already showed `exposure()` filter the per-launch repeats by category, not by text."""
+    if _user_bus_dir() is None:
+        pytest.skip("no user service-manager socket on this host")
+    monkeypatch.setattr(landlock, "_find_bwrap", lambda: None)
+    backend = LandlockContainmentBackend()
+    profile = backend.profile_for((str(tmp_path),), allow_network=True)
+    with pytest.warns(landlock.JailExposureWarning):
+        backend.launch(profile, tmp_path, ["/bin/true"])
+    assert issubclass(landlock.JailExposureWarning, RuntimeWarning)
+
+
+def test_landlock_bwrap_trial_that_hangs_counts_as_failed(tmp_path, monkeypatch, fresh_hiding) -> None:
+    """A trial bubblewrap that never returns must not hold the caller; it degrades like a failed one."""
+    if _user_bus_dir() is None:
+        pytest.skip("no user service-manager socket on this host")
+    hang = tmp_path / "bwrap"
+    hang.write_text("#!/bin/sh\nexec sleep 30\n")
+    hang.chmod(0o755)
+    monkeypatch.setattr(landlock, "_find_bwrap", lambda: str(hang))
+    monkeypatch.setattr(landlock, "_TRIAL_TIMEOUT_S", 1)
+    message = landlock.exposure()
+    assert message is not None
+    assert "did not finish a trial run within 1 s" in message
+
+
+def test_landlock_reports_a_writable_docker_socket(tmp_path, monkeypatch, fresh_hiding) -> None:
+    """The Docker daemon runs as root; a socket the user can write to is a way out the jail cannot hide."""
+    sock_path = tmp_path / "docker.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        server.bind(str(sock_path))
+        monkeypatch.setenv("DOCKER_HOST", f"unix://{sock_path}")
+        monkeypatch.setattr(landlock, "_hidden_dirs", lambda: ())
+        message = landlock.exposure()
+        assert message is not None
+        assert str(sock_path) in message
+        assert "Docker daemon" in message
+    finally:
+        server.close()
+
+
+def test_landlock_probe_runs_without_the_outer_prefix(tmp_path, fresh_hiding) -> None:
+    """The probe only touches files; a wrapper failing there would read as a denied write."""
+    backend = LandlockContainmentBackend()
+    profile = backend.profile_for((str(tmp_path),), allow_network=True)
+    landlock.set_outer_prefix(["/bin/false"])
+    backend.probe(profile, tmp_path, writable_roots=(str(tmp_path),))
+    assert backend.launch(profile, tmp_path, ["/bin/true"]).returncode != 0  # the body still gets it
 
 
 def test_landlock_outer_prefix_runs_outside_the_jail(tmp_path, fresh_hiding) -> None:
