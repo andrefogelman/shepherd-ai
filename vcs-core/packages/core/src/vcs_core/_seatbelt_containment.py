@@ -27,15 +27,19 @@ _DEV = '(allow file-write* (subpath "/dev"))'  # /dev/null etc. — not the work
 
 
 def _own_or_absent(candidate: str, is_kind: Callable[[int], bool]) -> str | None:
-    """``candidate`` with its parent resolved, unless something else sits there.
+    """``candidate`` resolved, unless an entry of another kind or owner sits there.
 
-    Something else is an entry of another kind or one this user does not own. Seatbelt matches resolved paths, so the parent is resolved; the last component is not
-    followed, since another user can plant a symlink at /tmp/tmux-<uid>. An absent entry
-    keeps its rule: a server started after the launch creates it there.
+    Seatbelt matches resolved paths, so the parent is resolved. The last component is
+    followed only when it is a link this user made, and then the target must be this
+    user's too: another user can plant a link at /tmp/tmux-<uid>. An absent entry keeps
+    its rule, since a server started after the launch creates it there.
     """
     path = Path(os.path.realpath(Path(candidate).parent)) / Path(candidate).name
     try:
         st = path.lstat()
+        if stat.S_ISLNK(st.st_mode) and st.st_uid == os.getuid():
+            path = Path(os.path.realpath(path))
+            st = path.lstat()
     except FileNotFoundError:
         return str(path)
     except OSError:
@@ -48,6 +52,11 @@ def _own_paths(candidates: Sequence[str], is_kind: Callable[[int], bool]) -> tup
     return tuple(dict.fromkeys(p for p in found if p is not None))
 
 
+def _skipped(candidates: Sequence[str], is_kind: Callable[[int], bool]) -> list[str]:
+    """The candidates that exist but `_own_or_absent` refuses: no rule covers them."""
+    return list(dict.fromkeys(c for c in candidates if c and os.path.lexists(c) and _own_or_absent(c, is_kind) is None))
+
+
 def _terminal_server_dirs() -> tuple[str, ...]:
     """Where this user's tmux and screen servers keep their sockets, existing or not.
 
@@ -55,6 +64,10 @@ def _terminal_server_dirs() -> tuple[str, ...]:
     new-window cmd` would have the user's tmux server start cmd outside the sandbox. A
     subpath deny also covers a directory created after the launch, so nothing is made here.
     """
+    return _own_paths(_terminal_server_candidates(), stat.S_ISDIR)
+
+
+def _terminal_server_candidates() -> list[str]:
     uid = os.getuid()
     candidates = [f"/tmp/tmux-{uid}"]
     if os.environ.get("TMUX_TMPDIR"):
@@ -63,7 +76,7 @@ def _terminal_server_dirs() -> tuple[str, ...]:
         candidates.append(os.environ["SCREENDIR"])
     if os.environ.get("TMPDIR"):
         candidates.append(str(Path(os.environ["TMPDIR"]) / ".screen"))
-    return _own_paths(candidates, stat.S_ISDIR)
+    return candidates
 
 
 def _named_sockets() -> tuple[str, ...]:
@@ -71,13 +84,17 @@ def _named_sockets() -> tuple[str, ...]:
 
     Denied one by one, not by directory: that directory can be a shared one such as /tmp.
     """
+    return _own_paths(_named_socket_candidates(), stat.S_ISSOCK)
+
+
+def _named_socket_candidates() -> list[str]:
     candidates: list[str] = []
     for address in os.environ.get("DBUS_SESSION_BUS_ADDRESS", "").split(";"):
         if address.startswith("unix:"):
             candidates += [f[len("path=") :] for f in address[len("unix:") :].split(",") if f.startswith("path=")]
     if os.environ.get("TMUX"):
         candidates.append(os.environ["TMUX"].split(",")[0])
-    return _own_paths(candidates, stat.S_ISSOCK)
+    return candidates
 
 
 def _docker_sockets() -> tuple[str, ...]:
@@ -185,6 +202,16 @@ class SeatbeltContainmentBackend:
                 f"DOCKER_HOST points at a Docker daemon over the network ({host.split('://')[0]}): a confined "
                 "command that reaches that daemon can escape the sandbox through it. Unset DOCKER_HOST, or put "
                 "the daemon where this user cannot reach it, to close this."
+            )
+        skipped = [
+            *_skipped(_terminal_server_candidates(), stat.S_ISDIR),
+            *_skipped(_named_socket_candidates(), stat.S_ISSOCK),
+        ]
+        if skipped:
+            parts.append(
+                f"{', '.join(skipped)} exist but are not a directory or socket this user owns (another user's, "
+                "or a link to one), so the sandbox has no rule for them: a server listening there stays "
+                "reachable. Remove them, or point the variable that names them elsewhere, to close this."
             )
         return " Also: ".join(parts) if parts else None
 

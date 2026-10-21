@@ -191,6 +191,7 @@ def fresh_hiding(monkeypatch):
     """Each test decides bubblewrap's fate afresh and leaves no outer prefix behind."""
     monkeypatch.setattr(landlock, "_HIDING_WORKS", {})
     monkeypatch.setattr(landlock, "_SOCKETS_UNDER", {})
+    monkeypatch.setattr(landlock, "_KEPT_WALKED", set())
     yield
     landlock.set_outer_prefix([])
 
@@ -228,6 +229,9 @@ def test_landlock_runs_with_a_warning_when_bwrap_cannot_start(tmp_path, monkeypa
 
 def test_landlock_reports_no_exposure_when_hidden_or_absent(monkeypatch, fresh_hiding) -> None:
     monkeypatch.setattr(landlock, "_docker_sockets", lambda hidden: ())
+    monkeypatch.setattr(landlock, "_x_displays", lambda: ())
+    monkeypatch.setattr(landlock, "_loopback_ssh", lambda: False)
+    monkeypatch.setattr(landlock, "_skipped", lambda candidates, is_kind: [])
     if _user_bus_dir() is not None and shutil.which("bwrap") is not None:
         assert landlock.exposure() is None
     monkeypatch.setattr(landlock, "_hidden_dirs", lambda: ())
@@ -439,32 +443,74 @@ def test_landlock_leaves_a_parent_it_cannot_write(tmp_path) -> None:
     assert not (tmp_path / "absent-parent").exists()
 
 
-def test_landlock_does_not_follow_a_symlink_planted_at_the_tmux_directory(tmp_path, monkeypatch) -> None:
-    """/tmp is shared: another user can put a symlink at /tmp/tmux-<uid>. Following it
-    would hide whatever it points at, so neither the link nor its target is masked."""
+def _as_another_user(monkeypatch) -> int:
+    """Make the backend see a uid other than the one that owns this test's files, so the
+    files stand in for another user's (chown needs root)."""
+    other = os.getuid() + 1
+    monkeypatch.setattr(landlock.os, "getuid", lambda: other)
+    monkeypatch.setattr(landlock, "_claim_socket_dirs", lambda candidates: None)
+    return other
+
+
+def test_landlock_does_not_follow_another_users_link_at_the_tmux_directory(tmp_path, monkeypatch) -> None:
+    """/tmp is shared: another user can put a link at /tmp/tmux-<uid>. Following it would
+    hide whatever it points at, so neither the link nor its target is masked."""
     tmux_tmp = tmp_path / "tmuxtmp"
     tmux_tmp.mkdir()
+    monkeypatch.setenv("TMUX_TMPDIR", str(tmux_tmp))
+    # control: this user's own directory there is hidden
+    real = tmux_tmp / f"tmux-{os.getuid()}"
+    real.mkdir()
+    assert str(real) in landlock._terminal_server_dirs()
+    other = _as_another_user(monkeypatch)
     target = tmp_path / "somewhere"
     target.mkdir()
-    (tmux_tmp / f"tmux-{os.getuid()}").symlink_to(target)
-    monkeypatch.setenv("TMUX_TMPDIR", str(tmux_tmp))
+    (tmux_tmp / f"tmux-{other}").symlink_to(target)
     dirs = landlock._terminal_server_dirs()
-    assert str(tmux_tmp / f"tmux-{os.getuid()}") not in dirs
+    assert str(tmux_tmp / f"tmux-{other}") not in dirs
     assert str(target) not in dirs
     assert list(target.iterdir()) == []
+
+
+def test_landlock_follows_this_users_own_link_to_its_own_directory(tmp_path, monkeypatch) -> None:
+    """A runtime directory linked elsewhere by this user (some container and WSL setups)
+    is still hidden, at the link's target."""
+    target = tmp_path / "real-runtime"
+    target.mkdir()
+    link = tmp_path / "runtime"
+    link.symlink_to(target)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(link))
+    assert str(target) in landlock._service_manager_dirs()
 
 
 def test_landlock_skips_a_directory_another_user_owns(tmp_path, monkeypatch) -> None:
     """tmux and screen refuse a socket directory they do not own; so does the mask."""
     mine = tmp_path / "mine"
     mine.mkdir()
-    assert landlock._existing_dirs([str(mine)]) == (str(mine),)
-    uid = os.getuid()
-    monkeypatch.setattr(landlock.os, "getuid", lambda: uid + 1)
-    assert landlock._existing_dirs([str(mine)]) == ()
+    assert landlock._own_dirs([str(mine)]) == (str(mine),)
+    _as_another_user(monkeypatch)
+    assert landlock._own_dirs([str(mine)]) == ()
 
 
-def test_landlock_does_not_follow_a_symlink_named_as_the_tmux_socket(tmp_path, monkeypatch) -> None:
+def test_landlock_reports_what_it_leaves_unmasked(tmp_path, monkeypatch, fresh_hiding) -> None:
+    """A skipped candidate is no longer silent: exposure() names it."""
+    tmux_tmp = tmp_path / "tmuxtmp"
+    tmux_tmp.mkdir()
+    monkeypatch.setenv("TMUX_TMPDIR", str(tmux_tmp))
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+    monkeypatch.setattr(landlock, "_docker_sockets", lambda hidden: ())
+    monkeypatch.setattr(landlock, "_x_displays", lambda: ())
+    monkeypatch.setattr(landlock, "_loopback_ssh", lambda: False)
+    monkeypatch.setattr(landlock, "_why_not_hidden", lambda dirs: None)
+    other = _as_another_user(monkeypatch)
+    planted = tmux_tmp / f"tmux-{other}"
+    assert planted.name not in (landlock.exposure() or "")
+    planted.symlink_to(tmp_path)
+    assert str(planted) in (landlock.exposure() or "")
+
+
+def test_landlock_does_not_follow_another_users_link_named_as_the_tmux_socket(tmp_path, monkeypatch) -> None:
     current = tmp_path / "current"
     current.mkdir()
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -472,16 +518,17 @@ def test_landlock_does_not_follow_a_symlink_named_as_the_tmux_socket(tmp_path, m
         server.bind(str(tmp_path / "real"))
         (current / "default").symlink_to(tmp_path / "real")
         monkeypatch.setenv("TMUX", f"{current}/default,1234,0")
-        named = landlock._named_sockets()
-        assert str(tmp_path / "real") not in named
-        assert str(current / "default") not in named
+        # control: this user's own link to its own socket is followed
+        assert landlock._named_sockets() == (str(tmp_path / "real"),)
+        _as_another_user(monkeypatch)
+        assert landlock._named_sockets() == ()
     finally:
         server.close()
 
 
-def test_landlock_walks_each_kept_path_once(tmp_path, monkeypatch) -> None:
+def test_landlock_walks_each_kept_path_once_while_it_holds(tmp_path, monkeypatch) -> None:
     """A workspace under a hidden directory can be a large tree; launches after the first
-    take its sockets from the first walk."""
+    reuse the walk until an entry right under it changes."""
     monkeypatch.setattr(landlock, "_SOCKETS_UNDER", {})
     walks: list[str] = []
     real_walk = os.walk
@@ -491,15 +538,143 @@ def test_landlock_walks_each_kept_path_once(tmp_path, monkeypatch) -> None:
         return real_walk(path, *args, **kwargs)
 
     monkeypatch.setattr(landlock.os, "walk", counted)
+    first_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    second_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        first_sock.bind(str(tmp_path / "s"))
+        first = landlock._sockets_under(str(tmp_path))
+        again = landlock._sockets_under(str(tmp_path))
+        assert first == again == (str(tmp_path / "s"),)
+        assert walks == [str(tmp_path)]
+        second_sock.bind(str(tmp_path / "t"))
+        os.utime(tmp_path, ns=(1, 1))  # the mtime must move even within one clock tick
+        assert set(landlock._sockets_under(str(tmp_path))) == {str(tmp_path / "s"), str(tmp_path / "t")}
+        assert walks == [str(tmp_path), str(tmp_path)]
+    finally:
+        first_sock.close()
+        second_sock.close()
+
+
+def test_landlock_drops_a_listed_socket_that_is_gone(tmp_path, monkeypatch, fresh_hiding) -> None:
+    """bubblewrap creates a file where a mount destination is missing, so a socket removed
+    since the walk must not stay in the argv: it would leave an empty file in the workspace."""
+    kept = tmp_path / "kept"
+    (kept / "sub").mkdir(parents=True)
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(kept / "sub" / "s"))
+    server.close()
+    assert landlock._sockets_under(str(kept)) == (str(kept / "sub" / "s"),)
+    (kept / "sub" / "s").unlink()
+    (kept / "sub").rmdir()
+    stamp = kept.stat().st_mtime_ns
+    monkeypatch.setitem(landlock._SOCKETS_UNDER, str(kept), (stamp, (str(kept / "sub" / "s"),)))
+    assert landlock._sockets_under(str(kept)) == ()
+    argv = landlock._bwrap_argv("bwrap", (str(tmp_path),), (str(kept),))
+    assert str(kept / "sub" / "s") not in argv
+
+
+def test_landlock_probe_walks_kept_paths_the_listing_missed(tmp_path, monkeypatch, fresh_hiding) -> None:
+    """The first probe walks the kept paths inside the jail itself, so a socket the walk
+    outside did not list is caught and the run degrades with the warning."""
+    _needs_bwrap()
+    tmux_tmp = tmp_path / "tmuxtmp"
+    hidden = tmux_tmp / f"tmux-{os.getuid()}"
+    work = hidden / "work"
+    work.mkdir(parents=True)
+    monkeypatch.setenv("TMUX_TMPDIR", str(tmux_tmp))
+    monkeypatch.setattr(landlock, "_docker_sockets", lambda hidden: ())
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        server.bind(str(tmp_path / "s"))
-        first = landlock._sockets_under(str(tmp_path))
-        second = landlock._sockets_under(str(tmp_path))
+        server.bind(str(work / "s"))
+        monkeypatch.setitem(landlock._SOCKETS_UNDER, str(work), (work.stat().st_mtime_ns, ()))
+        backend = LandlockContainmentBackend()
+        profile = backend.profile_for((str(work),), allow_network=True)
+        with pytest.warns(landlock.JailExposureWarning, match="is still a socket"):
+            backend.probe(profile, work, writable_roots=(str(work),))
     finally:
         server.close()
-    assert first == second == (str(tmp_path / "s"),)
-    assert walks == [str(tmp_path)]
+
+
+def test_landlock_probe_walks_kept_paths_once_per_process(tmp_path, monkeypatch, fresh_hiding) -> None:
+    tmux_tmp = tmp_path / "tmuxtmp"
+    hidden = tmux_tmp / f"tmux-{os.getuid()}"
+    work = hidden / "work"
+    work.mkdir(parents=True)
+    monkeypatch.setenv("TMUX_TMPDIR", str(tmux_tmp))
+    assert json.loads(landlock._hidden_dirs_spec((str(hidden),), (str(work),), walk_kept=True))["kept"] == [str(work)]
+    assert json.loads(landlock._hidden_dirs_spec((str(hidden),), (str(work),)))["kept"] == []
+    _needs_bwrap()
+    seen: list[list[str]] = []
+    backend = LandlockContainmentBackend()
+    real_launch = backend.launch
+
+    def recording(profile, root, command, **kwargs):
+        if command[1:2] == ["-c"] and command[2] == landlock._HIDDEN_DIRS_CHECK:
+            seen.append(json.loads(command[3])["kept"])
+        return real_launch(profile, root, command, **kwargs)
+
+    monkeypatch.setattr(backend, "launch", recording)
+    profile = backend.profile_for((str(work),), allow_network=True)
+    backend.probe(profile, work, writable_roots=(str(work),))
+    backend.probe(profile, work, writable_roots=(str(work),))
+    assert seen == [[str(work)], []]
+
+
+def test_landlock_jail_has_its_own_pid_namespace(tmp_path, monkeypatch, fresh_hiding) -> None:
+    """With a setuid bwrap, /proc/<pid>/root of a process outside would show the hidden
+    directories; in the jail's own pid namespace those processes are not there."""
+    _needs_bwrap()
+    tmux_tmp = tmp_path / "tmuxtmp"
+    (tmux_tmp / f"tmux-{os.getuid()}").mkdir(parents=True)
+    monkeypatch.setenv("TMUX_TMPDIR", str(tmux_tmp))
+    work = tmp_path / "work"
+    work.mkdir()
+    assert "--unshare-pid" in landlock._bwrap_argv("bwrap", (str(tmux_tmp),))
+    backend = LandlockContainmentBackend()
+    profile = backend.profile_for((str(work),), allow_network=True)
+    done = backend.launch(
+        profile,
+        work,
+        [sys.executable, "-c", "import os, sys; print(os.path.exists('/proc/' + sys.argv[1]))", str(os.getpid())],
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "False"
+
+
+def test_landlock_reports_a_reachable_x_display(tmp_path, monkeypatch, fresh_hiding) -> None:
+    monkeypatch.setattr(landlock, "_X11_DIR", str(tmp_path / "x11"))
+    monkeypatch.delenv("DISPLAY", raising=False)
+    assert landlock._x_displays() == ()
+    (tmp_path / "x11").mkdir()
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        server.bind(str(tmp_path / "x11" / "X0"))
+        assert landlock._x_displays() == (str(tmp_path / "x11" / "X0"),)
+    finally:
+        server.close()
+    monkeypatch.setenv("DISPLAY", "localhost:10.0")
+    assert "DISPLAY=localhost:10.0" in landlock._x_displays()
+    monkeypatch.setattr(landlock, "_docker_sockets", lambda hidden: ())
+    monkeypatch.setattr(landlock, "_loopback_ssh", lambda: False)
+    assert "keystrokes" in (landlock.exposure() or "")
+
+
+def test_landlock_reports_ssh_to_loopback_only_with_a_key_that_logs_in(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(landlock.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    monkeypatch.setattr(landlock.socket, "create_connection", lambda address, timeout: socket.socket())
+    ssh = tmp_path / ".ssh"
+    ssh.mkdir()
+    (ssh / "id_ed25519").write_text("")
+    assert landlock._loopback_ssh() is False  # no authorized_keys: the key does not log in here
+    (ssh / "authorized_keys").write_text("")
+    assert landlock._loopback_ssh() is True
+
+    def refused(address, timeout):
+        raise ConnectionRefusedError
+
+    monkeypatch.setattr(landlock.socket, "create_connection", refused)
+    assert landlock._loopback_ssh() is False  # no sshd on loopback
 
 
 def test_landlock_masks_a_socket_inside_a_bound_back_path(tmp_path, monkeypatch, fresh_hiding) -> None:

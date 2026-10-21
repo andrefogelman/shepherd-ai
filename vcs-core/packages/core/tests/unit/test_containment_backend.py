@@ -222,15 +222,33 @@ def test_seatbelt_profile_denies_both_tmux_directories_resolved(tmp_path, monkey
     assert f'(subpath "{os.path.realpath(tmp_path / "cur")}")' not in profile
 
 
-def test_seatbelt_denies_nothing_through_a_symlink_planted_at_the_tmux_directory(tmp_path, monkeypatch) -> None:
-    """Another user can put a symlink at /tmp/tmux-<uid>; the rule must not follow it."""
+def test_seatbelt_denies_nothing_through_another_users_link_at_the_tmux_directory(tmp_path, monkeypatch) -> None:
+    """Another user can put a link at /tmp/tmux-<uid>; the rule must not follow it."""
+    monkeypatch.setenv("TMUX_TMPDIR", str(tmp_path))
+    # control: this user's own directory there gets its rule
+    real = tmp_path / f"tmux-{os.getuid()}"
+    real.mkdir()
+    profile = SeatbeltContainmentBackend().profile_for((), allow_network=True)
+    assert f'(subpath "{os.path.realpath(real)}")' in profile
+    other = os.getuid() + 1
+    monkeypatch.setattr(seatbelt.os, "getuid", lambda: other)
     target = tmp_path / "somewhere"
     target.mkdir()
-    (tmp_path / f"tmux-{os.getuid()}").symlink_to(target)
-    monkeypatch.setenv("TMUX_TMPDIR", str(tmp_path))
+    (tmp_path / f"tmux-{other}").symlink_to(target)
     profile = SeatbeltContainmentBackend().profile_for((), allow_network=True)
     assert os.path.realpath(target) not in profile
-    assert f'(subpath "{os.path.realpath(tmp_path)}/tmux-{os.getuid()}")' not in profile
+    assert f'(subpath "{os.path.realpath(tmp_path)}/tmux-{other}")' not in profile
+    assert f"{tmp_path}/tmux-{other}" in (SeatbeltContainmentBackend().exposure() or "")
+
+
+def test_seatbelt_follows_this_users_own_link_to_its_own_directory(tmp_path, monkeypatch) -> None:
+    target = tmp_path / "screens"
+    target.mkdir()
+    link = tmp_path / "screenlink"
+    link.symlink_to(target)
+    monkeypatch.setenv("SCREENDIR", str(link))
+    profile = SeatbeltContainmentBackend().profile_for((), allow_network=True)
+    assert f'(subpath "{os.path.realpath(target)}")' in profile
 
 
 def test_seatbelt_skips_a_directory_another_user_owns(tmp_path, monkeypatch) -> None:

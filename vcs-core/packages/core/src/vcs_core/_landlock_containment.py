@@ -18,6 +18,7 @@ import json
 import os
 import pwd
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -71,10 +72,20 @@ _OUTER_PREFIX: list[str] = []
 #: once per process: a trial run costs a namespace setup on every launch otherwise.
 _HIDING_WORKS: dict[tuple[str, ...], str | None] = {}
 
-#: The sockets beneath each path bound back into a hidden directory, keyed by that path.
-#: Walked once per process: a workspace under a hidden directory can be a large tree,
-#: and every launch would walk it again. A socket created there later is not masked.
-_SOCKETS_UNDER: dict[str, tuple[str, ...]] = {}
+#: The sockets beneath each path bound back into a hidden directory, keyed by that path,
+#: with the path's mtime when they were found. A workspace under a hidden directory can be
+#: a large tree, so it is walked again only when an entry right under it changes; each
+#: launch drops the listed sockets that are gone, since bubblewrap would create a file
+#: where a mount destination is missing. A socket created deeper down after the walk is
+#: not masked (the probe's first check inside the jail walks those paths itself).
+_SOCKETS_UNDER: dict[str, tuple[int, tuple[str, ...]]] = {}
+
+#: Where X servers put their sockets.
+_X11_DIR = "/tmp/.X11-unix"
+
+#: The (hidden directories, kept paths) whose kept paths the probe has walked inside the
+#: jail in this process; later probes check only the masked sockets.
+_KEPT_WALKED: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
 
 
 class JailExposureWarning(RuntimeWarning):
@@ -191,21 +202,27 @@ def outer_prefix() -> tuple[str, ...]:
 
 
 def _own_entry(candidate: str, is_kind: Callable[[int], bool]) -> str | None:
-    """``candidate`` with its parent resolved, if this user owns it and it is that kind.
+    """``candidate`` resolved, if this user owns it and it is that kind, else None.
 
-    None otherwise. The last component is not followed: another user can plant a symlink at
-    /tmp/tmux-<uid>, and following it would put the mask over whatever it points at.
-    tmux and screen refuse a socket directory this user does not own, for the same reason.
+    The parent is resolved; the last component is followed only when it is a link this
+    user made (a runtime directory linked elsewhere, as some container and WSL setups do),
+    and then the target must be this user's too. Another user can plant a link at
+    /tmp/tmux-<uid>, and following it would put the mask over whatever it points at; tmux
+    and screen refuse a socket directory this user does not own, for the same reason.
     """
     path = Path(os.path.realpath(Path(candidate).parent)) / Path(candidate).name
     try:
         st = path.lstat()
+        if stat.S_ISLNK(st.st_mode) and st.st_uid == os.getuid():
+            path = Path(os.path.realpath(path))
+            st = path.lstat()
     except OSError:
         return None
     return str(path) if is_kind(st.st_mode) and st.st_uid == os.getuid() else None
 
 
-def _existing_dirs(candidates: Sequence[str]) -> tuple[str, ...]:
+def _own_dirs(candidates: Sequence[str]) -> tuple[str, ...]:
+    """The candidates that are directories this user owns (`_own_entry`), resolved."""
     found: list[str] = []
     for candidate in candidates:
         own = _own_entry(candidate, stat.S_ISDIR) if candidate else None
@@ -214,13 +231,22 @@ def _existing_dirs(candidates: Sequence[str]) -> tuple[str, ...]:
     return tuple(found)
 
 
+def _skipped(candidates: Sequence[str], is_kind: Callable[[int], bool]) -> list[str]:
+    """The candidates that exist but `_own_entry` refuses: the jail leaves them unmasked."""
+    return list(dict.fromkeys(c for c in candidates if c and os.path.lexists(c) and _own_entry(c, is_kind) is None))
+
+
 def _service_manager_dirs() -> tuple[str, ...]:
     """The user's runtime directories.
 
     Hidden whether or not a bus is there today: rootless Docker and Podman put their sockets
     in the runtime directory too, and a service manager may start after the launch.
     """
-    return _existing_dirs([os.environ.get("XDG_RUNTIME_DIR", ""), f"/run/user/{os.getuid()}"])
+    return _own_dirs(_runtime_dir_candidates())
+
+
+def _runtime_dir_candidates() -> list[str]:
+    return [os.environ.get("XDG_RUNTIME_DIR", ""), f"/run/user/{os.getuid()}"]
 
 
 def _named_sockets() -> tuple[str, ...]:
@@ -230,18 +256,22 @@ def _named_sockets() -> tuple[str, ...]:
     (`unix:path=/tmp/dbus-XXXX` where no systemd runs), and hiding that would empty /tmp
     for the command.
     """
+    found: list[str] = []
+    for candidate in _named_socket_candidates():
+        own = _own_entry(candidate, stat.S_ISSOCK) if candidate else None
+        if own is not None and own not in found:
+            found.append(own)
+    return tuple(found)
+
+
+def _named_socket_candidates() -> list[str]:
     candidates: list[str] = []
     for address in os.environ.get("DBUS_SESSION_BUS_ADDRESS", "").split(";"):
         if address.startswith("unix:"):
             candidates += [f[len("path=") :] for f in address[len("unix:") :].split(",") if f.startswith("path=")]
     if os.environ.get("TMUX"):
         candidates.append(os.environ["TMUX"].split(",")[0])
-    found: list[str] = []
-    for candidate in candidates:
-        own = _own_entry(candidate, stat.S_ISSOCK) if candidate else None
-        if own is not None and own not in found:
-            found.append(own)
-    return tuple(found)
+    return candidates
 
 
 def _terminal_server_candidates() -> list[str]:
@@ -282,7 +312,7 @@ def _terminal_server_dirs() -> tuple[str, ...]:
     """This user's tmux and screen socket directories, created where they can be."""
     candidates = _terminal_server_candidates()
     _claim_socket_dirs(candidates)
-    return _existing_dirs(candidates)
+    return _own_dirs(candidates)
 
 
 def _hidden_dirs() -> tuple[str, ...]:
@@ -307,18 +337,33 @@ def _bound_back(dirs: Sequence[str], keep: Sequence[str]) -> list[str]:
     ]
 
 
+def _is_socket(path: str) -> bool:
+    try:
+        return stat.S_ISSOCK(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
 def _sockets_under(path: str) -> tuple[str, ...]:
-    """Every socket file beneath ``path``, symlinks not followed (`_SOCKETS_UNDER`)."""
-    if path not in _SOCKETS_UNDER:
-        found: list[str] = []
-        for root, _dirs, files in os.walk(path):
-            for name in files:
-                full = Path(root) / name
-                with suppress(OSError):
-                    if stat.S_ISSOCK(full.lstat().st_mode):
-                        found.append(str(full))
-        _SOCKETS_UNDER[path] = tuple(found)
-    return _SOCKETS_UNDER[path]
+    """Every socket file beneath ``path`` that is still one, symlinks not followed.
+
+    The walk is reused while ``path``'s mtime holds (`_SOCKETS_UNDER`).
+    """
+    try:
+        stamp = Path(path).stat().st_mtime_ns
+    except OSError:
+        return ()
+    cached = _SOCKETS_UNDER.get(path)
+    if cached is None or cached[0] != stamp:
+        found = [
+            str(Path(root) / name)
+            for root, _dirs, files in os.walk(path)
+            for name in files
+            if _is_socket(str(Path(root) / name))
+        ]
+        cached = (stamp, tuple(found))
+        _SOCKETS_UNDER[path] = cached
+    return tuple(sock for sock in cached[1] if _is_socket(sock))
 
 
 def _masked_sockets(dirs: Sequence[str], keep: Sequence[str] = ()) -> list[str]:
@@ -342,7 +387,9 @@ def _bwrap_argv(bwrap: str, dirs: Sequence[str], keep: Sequence[str] = ()) -> li
     `systemd`) gets /dev/null bound over it, so connecting to it fails, and so does the
     bus or tmux socket the environment names outside those directories.
     """
-    argv = [bwrap, "--bind", "/", "/", "--dev-bind", "/dev", "/dev", "--proc", "/proc"]
+    # --unshare-pid: with a setuid bwrap (no user namespace) the command could otherwise
+    # read the hidden directories through another process's root, /proc/<pid>/root
+    argv = [bwrap, "--unshare-pid", "--bind", "/", "/", "--dev-bind", "/dev", "/dev", "--proc", "/proc"]
     for hidden in dirs:
         argv += ["--tmpfs", hidden]
     for path in _bound_back(dirs, keep):
@@ -353,8 +400,10 @@ def _bwrap_argv(bwrap: str, dirs: Sequence[str], keep: Sequence[str] = ()) -> li
 
 
 #: Exits 1, printing what it found, when a hidden directory holds anything besides the
-#: entries leading to a path bound back into it, or a masked socket is still a socket.
-#: argv[1] is JSON: {"dirs": [[directory, [allowed entry, ...]], ...], "masked": [socket, ...]}.
+#: entries leading to a path bound back into it, directly or through the launching
+#: process's /proc/<pid>/root, or a masked socket or any file under a walked kept path is
+#: still a socket. argv[1] is JSON: {"dirs": [[directory, [allowed entry, ...]], ...],
+#: "masked": [socket, ...], "kept": [path to walk, ...], "host": pid}.
 _HIDDEN_DIRS_CHECK = (
     "import json, os, stat, sys\n"
     "spec = json.loads(sys.argv[1])\n"
@@ -362,19 +411,25 @@ _HIDDEN_DIRS_CHECK = (
     "    try: return stat.S_ISSOCK(os.lstat(p).st_mode)\n"
     "    except OSError: return False\n"
     "for d, a in spec['dirs']:\n"
-    "    extra = sorted(set(os.listdir(d)) - set(a))\n"
-    "    if extra: print(d, 'still shows', extra); sys.exit(1)\n"
-    "for p in spec['masked']:\n"
+    "    for v in (d, '/proc/%d/root%s' % (spec['host'], d)):\n"
+    "        try: extra = sorted(set(os.listdir(v)) - set(a))\n"
+    "        except OSError:\n"
+    "            if v == d: raise\n"
+    "            continue\n"
+    "        if extra: print(v, 'still shows', extra); sys.exit(1)\n"
+    "walked = [os.path.join(r, n) for t in spec['kept'] for r, _, f in os.walk(t) for n in f]\n"
+    "for p in spec['masked'] + walked:\n"
     "    if sock(p): print(p, 'is still a socket'); sys.exit(1)\n"
 )
 
 
-def _hidden_dirs_spec(dirs: Sequence[str], keep: Sequence[str] = ()) -> str:
+def _hidden_dirs_spec(dirs: Sequence[str], keep: Sequence[str] = (), *, walk_kept: bool = False) -> str:
     """The `_HIDDEN_DIRS_CHECK` argument for ``dirs``.
 
     Each directory goes with the first component of every kept path under it: the only
     entries allowed to show inside the jail. The masked sockets are listed too, since
-    none of them may still be one.
+    none of them may still be one; with ``walk_kept`` the check also walks the bound-back
+    paths itself, which catches a socket the walk outside the jail did not list.
     """
     spec = []
     for hidden in dirs:
@@ -386,7 +441,14 @@ def _hidden_dirs_spec(dirs: Sequence[str], keep: Sequence[str] = ()) -> str:
             }
         )
         spec.append([hidden, allowed])
-    return json.dumps({"dirs": spec, "masked": _masked_sockets(dirs, keep)})
+    return json.dumps(
+        {
+            "dirs": spec,
+            "masked": _masked_sockets(dirs, keep),
+            "kept": _bound_back(dirs, keep) if walk_kept else [],
+            "host": os.getpid(),
+        }
+    )
 
 
 def _why_not_hidden(dirs: tuple[str, ...]) -> str | None:
@@ -432,6 +494,33 @@ def _docker_sockets(hidden: Sequence[str]) -> tuple[str, ...]:
     return tuple(found)
 
 
+def _x_displays() -> tuple[str, ...]:
+    """The X server sockets this user can connect to, and a display over the network."""
+    found: list[str] = []
+    with suppress(OSError), os.scandir(_X11_DIR) as entries:
+        found += sorted(e.path for e in entries if _is_socket(e.path) and os.access(e.path, os.W_OK))
+    display = os.environ.get("DISPLAY", "")
+    if display.split(":")[0] not in ("", "unix"):
+        found.append(f"DISPLAY={display}")
+    return tuple(found)
+
+
+def _loopback_ssh() -> bool:
+    """True when sshd answers on loopback and this user's key or agent can log in to it."""
+    ssh = Path.home() / ".ssh"
+    if not (ssh / "authorized_keys").exists():
+        return False
+    if not os.environ.get("SSH_AUTH_SOCK") and not any(p.suffix != ".pub" for p in ssh.glob("id_*")):
+        return False
+    for host in ("127.0.0.1", "::1"):
+        try:
+            socket.create_connection((host, 22), timeout=0.2).close()
+        except OSError:
+            continue
+        return True
+    return False
+
+
 def exposure() -> str | None:
     """A message for the user when the jail leaves a command server reachable, else None.
 
@@ -464,6 +553,29 @@ def exposure() -> str | None:
             f"DOCKER_HOST points at a Docker daemon over the network ({host.split('://')[0]}): the jail does not "
             "govern network connections, so a confined command that reaches that daemon can escape the jail "
             "through it. Unset DOCKER_HOST, or put the daemon where this user cannot reach it, to close this."
+        )
+    skipped = [
+        *_skipped([*_runtime_dir_candidates(), *_terminal_server_candidates()], stat.S_ISDIR),
+        *_skipped(_named_socket_candidates(), stat.S_ISSOCK),
+    ]
+    if skipped:
+        parts.append(
+            f"{', '.join(skipped)} exist but are not a directory or socket this user owns (another user's, or a "
+            "link to one), so the jail does not mask them: a server listening there stays reachable from inside "
+            "the jail. Remove them, or point the variable that names them elsewhere, to close this."
+        )
+    displays = _x_displays()
+    if displays:
+        parts.append(
+            f"the X display ({', '.join(displays)}) is reachable: a confined command can send keystrokes to this "
+            "user's windows, a terminal among them, and so run commands outside the jail. The jail does not hide "
+            "it; run where no X session of this user is reachable to close this."
+        )
+    if _loopback_ssh():
+        parts.append(
+            "sshd answers on this host's loopback and this user's ssh key or agent can log in to it: `ssh "
+            "localhost cmd` from inside the jail runs cmd outside it. The jail does not govern network "
+            "connections; run where sshd does not accept this user's key to close this."
         )
     return " Also: ".join(parts) if parts else None
 
@@ -588,10 +700,13 @@ class LandlockContainmentBackend:
         hidden = _hidden_dirs()
         if hidden and _why_not_hidden(hidden) is None:
             kept = (str(wd), *json.loads(profile or "[]"))
+            # the kept paths are walked inside the jail by the first probe for them in this
+            # process; later probes check the masked sockets only
+            walk = (hidden, kept) not in _KEPT_WALKED
             done = self.launch(
                 profile,
                 working_root,
-                [sys.executable, "-c", _HIDDEN_DIRS_CHECK, _hidden_dirs_spec(hidden, kept)],
+                [sys.executable, "-c", _HIDDEN_DIRS_CHECK, _hidden_dirs_spec(hidden, kept, walk_kept=walk)],
                 outer=False,
             )
             if done.returncode == _CONFINE_FAILED_RC:
@@ -602,6 +717,8 @@ class LandlockContainmentBackend:
                     f"a command server's socket was still reachable inside the jail ({detail or done.returncode})"
                 )
                 warnings.warn(exposure() or "", JailExposureWarning, stacklevel=2)
+            else:
+                _KEPT_WALKED.add((hidden, kept))
 
         # (1) liveness: a write OUTSIDE the workspace must be denied.
         if not _denied(wd.parent / ".jail-probe"):
