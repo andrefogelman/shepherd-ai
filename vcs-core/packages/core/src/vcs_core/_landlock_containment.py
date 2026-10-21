@@ -39,6 +39,14 @@ _WRITE_ACCESS = (
     (1 << 1) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11) | (1 << 12)
 )
 
+#: Shells discard output by writing to /dev/null (`cmd >/dev/null`, `2>/dev/null`).
+#: Seatbelt allows writes under /dev; here every path outside the roots is denied, so
+#: each such redirect failed with EACCES and the command exited 1 before it ran. A
+#: confined Claude worker hit this on 26 of 173 Bash calls. Grant write_file on that one
+#: character device, nothing under it and nothing beside it (/dev/shm stays denied).
+_DEV_NULL = "/dev/null"
+_WRITE_FILE = 1 << 1
+
 _RUNNER_SENTINEL = "__landlock_confine_exec__"
 _CONFINE_FAILED_RC = 3  # runner exit code when confinement could not be established (touch never uses 3)
 
@@ -96,10 +104,36 @@ def landlock_confine(writable_dirs: Sequence[str]) -> None:
                 raise OSError(ctypes.get_errno(), "landlock_add_rule")
         finally:
             os.close(dirfd)
+    _allow_dev_null(fd)
     if _LIBC.prctl(_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
         raise OSError(ctypes.get_errno(), "prctl(NO_NEW_PRIVS)")
     if _syscall(_NR_RESTRICT_SELF, ctypes.c_int(fd), ctypes.c_uint(0)) < 0:
         raise OSError(ctypes.get_errno(), "landlock_restrict_self")
+
+
+def _allow_dev_null(ruleset_fd: int) -> None:
+    """Add a write_file-only rule for /dev/null to the ruleset.
+
+    Landlock accepts a PATH_BENEATH rule on a single file when it grants only file
+    rights. Any failure (no /dev/null, an older kernel refusing the rule) leaves the
+    ruleset as it was: the jail stays at least as strict as before, never looser.
+    """
+    try:
+        # O_PATH (Linux): a handle on the device that never opens it.
+        nullfd = os.open(_DEV_NULL, getattr(os, "O_PATH", os.O_RDONLY) | os.O_CLOEXEC)
+    except OSError:
+        return
+    try:
+        rule = _PathBeneathAttr(allowed_access=_WRITE_FILE, parent_fd=nullfd)
+        _syscall(
+            _NR_ADD_RULE,
+            ctypes.c_int(ruleset_fd),
+            ctypes.c_int(_LL_RULE_PATH_BENEATH),
+            ctypes.byref(rule),
+            ctypes.c_uint(0),
+        )
+    finally:
+        os.close(nullfd)
 
 
 class LandlockContainmentBackend:

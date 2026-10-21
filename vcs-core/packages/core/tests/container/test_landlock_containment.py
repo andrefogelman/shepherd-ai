@@ -104,3 +104,23 @@ def test_landlock_probe_catches_readonly_mislowered_to_writable(tmp_path) -> Non
     mislowered = backend.profile_for((str(tmp_path),), allow_network=True)
     with pytest.raises(JailNotEstablished):
         backend.probe(mislowered, tmp_path, writable_roots=())
+
+
+def test_landlock_allows_dev_null_and_nothing_else_under_dev(tmp_path) -> None:
+    """Shells discard output into /dev/null; denying it made every `cmd >/dev/null` exit 1.
+    Only that device is granted: /dev/shm, writable to anyone outside the jail, stays denied."""
+    backend = LandlockContainmentBackend()
+    permissive = backend.profile_for((str(tmp_path),), allow_network=True)
+    readonly = backend.profile_for((), allow_network=False)
+    for profile in (permissive, readonly):
+        done = backend.launch(profile, tmp_path, ["/bin/sh", "-c", "echo hi > /dev/null && echo ok 2>/dev/null"])
+        assert done.returncode == 0, done.stderr
+        assert done.stdout.strip() == "ok"
+    if os.path.isdir("/dev/shm"):
+        target = f"/dev/shm/landlock-probe-{os.getpid()}"
+        try:
+            assert backend.launch(permissive, tmp_path, ["/usr/bin/touch", "--", target]).returncode != 0
+            assert not os.path.exists(target)
+        finally:
+            if os.path.exists(target):
+                os.unlink(target)
