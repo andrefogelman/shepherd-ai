@@ -351,3 +351,160 @@ def test_landlock_outer_prefix_runs_outside_the_jail(tmp_path, fresh_hiding) -> 
         outside.unlink(missing_ok=True)
     landlock.set_outer_prefix([])
     assert landlock.outer_prefix() == ()
+
+
+def test_landlock_hides_the_runtime_dir_without_a_bus(tmp_path, monkeypatch) -> None:
+    """Rootless Docker and Podman listen in the runtime directory too, and a service manager
+    may start after the launch: the directory is hidden whether or not a bus is there."""
+    rundir = tmp_path / "run"
+    rundir.mkdir()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(rundir))
+    assert os.path.realpath(rundir) in landlock._service_manager_dirs()
+
+
+def test_landlock_masks_a_session_bus_named_elsewhere_and_not_its_directory(
+    tmp_path, monkeypatch, fresh_hiding
+) -> None:
+    """Where no systemd runs, the bus is `unix:path=/tmp/dbus-XXXX`: hiding its directory
+    would empty /tmp for the command, so only the socket gets /dev/null over it."""
+    _needs_bwrap()
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    (shared / "neighbour").write_text("x")
+    bus = shared / "dbus-test"
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", f"unix:guid=abc,path={bus};tcp:host=localhost")
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        server.bind(str(bus))
+        server.listen(1)
+        assert os.path.realpath(shared) not in landlock._hidden_dirs()
+        assert landlock._named_sockets() == (os.path.realpath(bus),)
+        work = tmp_path / "work"
+        work.mkdir()
+        backend = LandlockContainmentBackend()
+        profile = backend.profile_for((str(work),), allow_network=True)
+        backend.probe(profile, work, writable_roots=(str(work),))
+        done = backend.launch(
+            profile,
+            work,
+            [
+                sys.executable,
+                "-c",
+                "import os, stat, sys; d = sys.argv[1]\n"
+                "print(sorted(os.listdir(d)), stat.S_ISSOCK(os.lstat(os.path.join(d, 'dbus-test')).st_mode))",
+                str(shared),
+            ],
+        )
+        assert done.returncode == 0, done.stderr
+        assert done.stdout.strip() == "['dbus-test', 'neighbour'] False"
+    finally:
+        server.close()
+
+
+def test_landlock_hides_both_tmux_directories_and_masks_the_socket_tmux_names(tmp_path, monkeypatch) -> None:
+    """tmux uses $TMUX_TMPDIR when set and /tmp otherwise; the caller's server may use
+    either. The socket $TMUX names is masked alone, since its directory may be shared."""
+    tmux_tmp = tmp_path / "tmuxtmp"
+    tmux_tmp.mkdir()
+    current = tmp_path / "current"
+    current.mkdir()
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        server.bind(str(current / "default"))
+        monkeypatch.setenv("TMUX_TMPDIR", str(tmux_tmp))
+        monkeypatch.setenv("TMUX", f"{current}/default,1234,0")
+        candidates = landlock._terminal_server_candidates()
+        assert f"/tmp/tmux-{os.getuid()}" in candidates
+        assert str(tmux_tmp / f"tmux-{os.getuid()}") in candidates
+        assert str(current) not in candidates
+        assert os.path.realpath(current / "default") in landlock._named_sockets()
+    finally:
+        server.close()
+
+
+def test_landlock_creates_an_absent_tmux_directory_private(tmp_path, monkeypatch) -> None:
+    """A tmux server started during the launch puts its socket under the mask, not beside it."""
+    tmux_tmp = tmp_path / "tmuxtmp"
+    tmux_tmp.mkdir()
+    monkeypatch.setenv("TMUX_TMPDIR", str(tmux_tmp))
+    made = tmux_tmp / f"tmux-{os.getuid()}"
+    assert str(made) in landlock._terminal_server_dirs()
+    assert made.is_dir()
+    assert made.stat().st_mode & 0o777 == 0o700
+
+
+def test_landlock_leaves_a_parent_it_cannot_write(tmp_path) -> None:
+    landlock._claim_socket_dirs([str(tmp_path / "absent-parent" / "tmux-1")])
+    assert not (tmp_path / "absent-parent").exists()
+
+
+def test_landlock_masks_a_socket_inside_a_bound_back_path(tmp_path, monkeypatch, fresh_hiding) -> None:
+    """A kept path under a hidden directory comes back with its contents; a socket in it
+    gets /dev/null over it, so the bus under a kept `systemd` cannot be reached."""
+    _needs_bwrap()
+    tmux_tmp = tmp_path / "tmuxtmp"
+    hidden = tmux_tmp / f"tmux-{os.getuid()}"
+    work = hidden / "work"
+    work.mkdir(parents=True)
+    monkeypatch.setenv("TMUX_TMPDIR", str(tmux_tmp))
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock_path = work / "s"
+    try:
+        server.bind(str(sock_path))
+        server.listen(1)
+        backend = LandlockContainmentBackend()
+        profile = backend.profile_for((str(work),), allow_network=True)
+        backend.probe(profile, work, writable_roots=(str(work),))
+        done = backend.launch(
+            profile,
+            work,
+            [
+                sys.executable,
+                "-c",
+                "import os, socket, stat, sys\n"
+                "print(stat.S_ISSOCK(os.lstat(sys.argv[1]).st_mode))\n"
+                "c = socket.socket(socket.AF_UNIX)\n"
+                "try:\n    c.connect(sys.argv[1]); print('connected')\n"
+                "except OSError as e:\n    print('refused', e.errno)\n",
+                str(sock_path),
+            ],
+        )
+        assert done.returncode == 0, done.stderr
+        lines = done.stdout.split("\n")
+        assert lines[0] == "False"
+        assert lines[1].startswith("refused")
+    finally:
+        server.close()
+
+
+def test_landlock_probe_degrades_when_the_hiding_check_fails(tmp_path, monkeypatch, fresh_hiding) -> None:
+    """A check that finds something still reachable warns and lets the run go on without bubblewrap."""
+    _needs_bwrap()
+    tmux_tmp = tmp_path / "tmuxtmp"
+    (tmux_tmp / f"tmux-{os.getuid()}").mkdir(parents=True)
+    monkeypatch.setenv("TMUX_TMPDIR", str(tmux_tmp))
+    monkeypatch.setattr(landlock, "_docker_sockets", lambda hidden: ())
+    work = tmp_path / "work"
+    work.mkdir()
+    dirs = landlock._hidden_dirs()
+    assert landlock._why_not_hidden(dirs) is None  # bubblewrap works here
+    monkeypatch.setattr(landlock, "_HIDDEN_DIRS_CHECK", "import sys; print('socket left'); sys.exit(1)")
+    backend = LandlockContainmentBackend()
+    profile = backend.profile_for((str(work),), allow_network=True)
+    with pytest.warns(landlock.JailExposureWarning, match="socket left"):
+        backend.probe(profile, work, writable_roots=(str(work),))
+    with pytest.warns(landlock.JailExposureWarning):
+        assert landlock._hiding_argv((str(work),)) == []
+    done = backend.launch(profile, work, ["/bin/sh", "-c", "echo ran"])
+    assert done.stdout.strip() == "ran"
+
+
+def test_landlock_reports_docker_host_over_the_network(monkeypatch, fresh_hiding) -> None:
+    monkeypatch.setattr(landlock, "_hidden_dirs", lambda: ())
+    monkeypatch.setattr(landlock, "_docker_sockets", lambda hidden: ())
+    monkeypatch.setenv("DOCKER_HOST", "tcp://127.0.0.1:2375")
+    message = landlock.exposure()
+    assert message is not None
+    assert "over the network (tcp)" in message
+    monkeypatch.setenv("DOCKER_HOST", "ssh://user@host")
+    assert "over the network (ssh)" in (landlock.exposure() or "")

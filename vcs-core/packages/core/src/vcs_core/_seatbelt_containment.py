@@ -25,6 +25,58 @@ if TYPE_CHECKING:
 _DEV = '(allow file-write* (subpath "/dev"))'  # /dev/null etc. — not the workspace
 
 
+def _terminal_server_dirs() -> tuple[str, ...]:
+    """Where this user's tmux and screen servers keep their sockets, existing or not.
+
+    `(allow default)` lets a confined command connect to any Unix socket, so `tmux
+    new-window cmd` would have the user's tmux server start cmd outside the sandbox. A
+    subpath deny also covers a directory created after the launch, so nothing is made here.
+    """
+    uid = os.getuid()
+    candidates = [f"/tmp/tmux-{uid}"]
+    if os.environ.get("TMUX_TMPDIR"):
+        candidates.append(str(Path(os.environ["TMUX_TMPDIR"]) / f"tmux-{uid}"))
+    if os.environ.get("SCREENDIR"):
+        candidates.append(os.environ["SCREENDIR"])
+    if os.environ.get("TMPDIR"):
+        candidates.append(str(Path(os.environ["TMPDIR"]) / ".screen"))
+    return tuple(dict.fromkeys(os.path.realpath(c) for c in candidates if c))
+
+
+def _named_sockets() -> tuple[str, ...]:
+    """The session bus and the tmux server the environment names.
+
+    Denied one by one, not by directory: that directory can be a shared one such as /tmp.
+    """
+    candidates: list[str] = []
+    for address in os.environ.get("DBUS_SESSION_BUS_ADDRESS", "").split(";"):
+        if address.startswith("unix:"):
+            candidates += [f[len("path=") :] for f in address[len("unix:") :].split(",") if f.startswith("path=")]
+    if os.environ.get("TMUX"):
+        candidates.append(os.environ["TMUX"].split(",")[0])
+    return tuple(dict.fromkeys(os.path.realpath(c) for c in candidates if c))
+
+
+def _docker_sockets() -> tuple[str, ...]:
+    """Docker daemon sockets this user can write to (Docker Desktop, Colima, OrbStack)."""
+    home = Path.home()
+    candidates = [
+        "/var/run/docker.sock",
+        str(home / ".docker/run/docker.sock"),
+        str(home / ".colima/default/docker.sock"),
+        str(home / ".orbstack/run/docker.sock"),
+    ]
+    host = os.environ.get("DOCKER_HOST", "")
+    if host.startswith("unix://"):
+        candidates.append(host[len("unix://") :])
+    found: list[str] = []
+    for candidate in candidates:
+        real = os.path.realpath(candidate)
+        if real not in found and Path(real).exists() and os.access(real, os.W_OK):
+            found.append(real)
+    return tuple(found)
+
+
 def _sbpl_string(value: str) -> str:
     """Escape a path for a double-quoted SBPL string literal.
 
@@ -36,7 +88,14 @@ def _sbpl_string(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def lower_to_seatbelt(writable_roots: Sequence[str], *, allow_network: bool, canonicalize: bool = True) -> str:
+def lower_to_seatbelt(
+    writable_roots: Sequence[str],
+    *,
+    allow_network: bool,
+    canonicalize: bool = True,
+    deny_sockets: Sequence[str] = (),
+    deny_socket_files: Sequence[str] = (),
+) -> str:
     """`may=` -> Seatbelt SBPL, deny-closed over an arbitrary set of writable roots.
 
     The profile denies all file-writes, then re-allows writes beneath each canonicalized
@@ -50,6 +109,11 @@ def lower_to_seatbelt(writable_roots: Sequence[str], *, allow_network: bool, can
     subpath symlinks, so an un-canonicalized root wrongly denies in-root writes via
     /var->/private/var). `canonicalize=False` exists only to demonstrate that gotcha in tests.
     Validated end-to-end in spikes/sandbox-jail/macos_may_lowering.py (15/15).
+
+    Each directory in ``deny_sockets`` gets a `network-outbound` deny, which refuses a
+    connect to any Unix socket beneath it; each path in ``deny_socket_files`` gets one for
+    that socket alone. Unix sockets as a whole stay open: name
+    resolution goes through mDNSResponder's socket.
     """
     roots = [os.path.realpath(root) if canonicalize else str(root) for root in writable_roots]
     lines = ["(version 1)", "(allow default)", "(deny file-write*)"]
@@ -58,6 +122,8 @@ def lower_to_seatbelt(writable_roots: Sequence[str], *, allow_network: bool, can
         lines.append("(deny network-outbound)")
     lines.extend(f'(allow file-write* (subpath "{_sbpl_string(root)}"))' for root in roots)
     lines.append(_DEV)
+    lines.extend(f'(deny network-outbound (subpath "{_sbpl_string(d)}"))' for d in deny_sockets)
+    lines.extend(f'(deny network-outbound (literal "{_sbpl_string(f)}"))' for f in deny_socket_files)
     return "\n".join(lines) + "\n"
 
 
@@ -75,7 +141,29 @@ class SeatbeltContainmentBackend:
         return (True, "sandbox-exec present")
 
     def profile_for(self, writable_roots: Sequence[str], *, allow_network: bool) -> str:
-        return lower_to_seatbelt(writable_roots, allow_network=allow_network)
+        return lower_to_seatbelt(
+            writable_roots,
+            allow_network=allow_network,
+            deny_sockets=_terminal_server_dirs(),
+            deny_socket_files=_named_sockets(),
+        )
+
+    def exposure(self) -> str | None:
+        """What a confined command can still reach to run code outside the sandbox, or None."""
+        parts = [
+            f"{sock} is writable by this user: a confined command can drive the Docker daemon and escape the "
+            "sandbox through it. The sandbox does not block it; stop the daemon, or run where the socket is "
+            "not writable, to close this."
+            for sock in _docker_sockets()
+        ]
+        host = os.environ.get("DOCKER_HOST", "")
+        if host.startswith(("tcp://", "ssh://", "http://", "https://")):
+            parts.append(
+                f"DOCKER_HOST points at a Docker daemon over the network ({host.split('://')[0]}): a confined "
+                "command that reaches that daemon can escape the sandbox through it. Unset DOCKER_HOST, or put "
+                "the daemon where this user cannot reach it, to close this."
+            )
+        return " Also: ".join(parts) if parts else None
 
     def _attempt_write(self, profile: str, working_root: Any, target: Path) -> bool:
         """Attempt one create of `target` under `profile` (cwd=WORKDIR); True iff it landed.

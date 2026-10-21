@@ -10,9 +10,14 @@ wiring is B3c). macOS-gated; the Linux Landlock member is `_landlock_containment
 from __future__ import annotations
 
 import os
+import shutil
+import socket
 import sys
+import tempfile
+from pathlib import Path
 
 import pytest
+from vcs_core import _seatbelt_containment as seatbelt
 from vcs_core._containment import ContainmentBackend, JailNotEstablished
 from vcs_core._seatbelt_containment import SeatbeltContainmentBackend, lower_to_seatbelt
 
@@ -186,3 +191,84 @@ def test_seatbelt_escapes_backslash_in_workspace_path(tmp_path) -> None:
     inside = weird / "ok.txt"
     backend.launch(backend.profile_for(_permissive(weird), allow_network=True), weird, ["/usr/bin/touch", str(inside)])
     assert inside.exists()
+
+
+def test_lower_to_seatbelt_denies_connects_under_each_socket_dir(tmp_path) -> None:
+    plain = lower_to_seatbelt(_permissive(tmp_path), allow_network=True)
+    assert "(deny network-outbound" not in plain  # unchanged without deny_sockets
+    denied = lower_to_seatbelt(
+        _permissive(tmp_path),
+        allow_network=True,
+        deny_sockets=("/private/tmp/tmux-7",),
+        deny_socket_files=("/private/tmp/dbus-x",),
+    )
+    assert denied.startswith(plain.rstrip("\n"))
+    assert denied.rstrip("\n").splitlines()[-2:] == [
+        '(deny network-outbound (subpath "/private/tmp/tmux-7"))',
+        '(deny network-outbound (literal "/private/tmp/dbus-x"))',
+    ]
+
+
+def test_seatbelt_profile_denies_both_tmux_directories_resolved(tmp_path, monkeypatch) -> None:
+    """The deny takes realpaths: Seatbelt does not resolve /tmp to /private/tmp itself."""
+    monkeypatch.setenv("TMUX_TMPDIR", str(tmp_path))
+    monkeypatch.setenv("TMUX", f"{tmp_path}/cur/default,1,0")
+    profile = SeatbeltContainmentBackend().profile_for((), allow_network=True)
+    uid = os.getuid()
+    for path in (f"/tmp/tmux-{uid}", f"{tmp_path}/tmux-{uid}"):
+        assert f'(deny network-outbound (subpath "{os.path.realpath(path)}"))' in profile
+    # the directory $TMUX names may be shared (/tmp): only its socket is denied
+    assert f'(deny network-outbound (literal "{os.path.realpath(tmp_path / "cur" / "default")}"))' in profile
+    assert f'(subpath "{os.path.realpath(tmp_path / "cur")}")' not in profile
+
+
+@_macos
+def test_seatbelt_refuses_a_connect_to_a_tmux_socket(monkeypatch) -> None:
+    """`(allow default)` lets a sandboxed command reach any Unix socket; a tmux server there
+    would start commands outside the sandbox. The control socket beside it stays reachable."""
+    short = Path(tempfile.mkdtemp(prefix="sb", dir="/tmp"))  # sun_path is 104 bytes on macOS
+    servers: list[socket.socket] = []
+    try:
+        monkeypatch.setenv("TMUX_TMPDIR", str(short))  # unresolved /tmp, as a user would set it
+        tmux_dir = short / f"tmux-{os.getuid()}"
+        tmux_dir.mkdir(mode=0o700)
+        targets = [str(tmux_dir / "default"), str(short / "control")]
+        for path in targets:
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(path)
+            server.listen(1)
+            servers.append(server)
+        backend = SeatbeltContainmentBackend()
+        profile = backend.profile_for((str(short),), allow_network=True)
+        probe = (
+            "import socket, sys\n"
+            "for p in sys.argv[1:]:\n"
+            "    c = socket.socket(socket.AF_UNIX)\n"
+            "    try:\n        c.connect(p); print('connected')\n"
+            "    except OSError:\n        print('refused')\n"
+        )
+        done = backend.launch(profile, short, [sys.executable, "-c", probe, *targets])
+        assert done.returncode == 0, done.stderr
+        assert done.stdout.split() == ["refused", "connected"]
+    finally:
+        for server in servers:
+            server.close()
+        shutil.rmtree(short, ignore_errors=True)
+
+
+def test_seatbelt_reports_docker_reachable(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(seatbelt.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    system_sock = Path("/var/run/docker.sock")
+    if system_sock.exists() and os.access(system_sock, os.W_OK):
+        pytest.skip("this host has a writable /var/run/docker.sock")
+    backend = SeatbeltContainmentBackend()
+    assert backend.exposure() is None
+    sock_dir = tmp_path / ".docker" / "run"
+    sock_dir.mkdir(parents=True)
+    (sock_dir / "docker.sock").write_text("")
+    message = backend.exposure()
+    assert message is not None
+    assert "docker.sock" in message
+    monkeypatch.setenv("DOCKER_HOST", "tcp://127.0.0.1:2375")
+    assert "over the network (tcp)" in (backend.exposure() or "")

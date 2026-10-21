@@ -55,11 +55,10 @@ _WRITE_FILE = 1 << 1
 #: runtime directory holds the session bus and systemd's private socket, so a confined
 #: command could run `systemd-run --user -- cmd`: the service manager starts cmd as its own
 #: child, outside this process tree, and the jail never applies to it. tmux and screen
-#: servers do the same for `tmux new-window cmd` and `screen -X`. Where such a socket
-#: directory exists and bubblewrap works, bubblewrap mounts an empty tmpfs over it before
-#: the runner confines itself. Where bubblewrap is missing or cannot start, the launch
-#: still runs, with that door open, and `exposure` says so.
-_SERVICE_MANAGER_SOCKETS = ("bus", "systemd/private")
+#: servers do the same for `tmux new-window cmd` and `screen -X`, and a rootless Docker or
+#: Podman daemon listens there too. Where bubblewrap works, it mounts an empty tmpfs over
+#: each such directory before the runner confines itself. Where bubblewrap is missing or
+#: cannot start, the launch still runs, with that door open, and `exposure` says so.
 
 #: A trial bubblewrap run that takes longer than this counts as one that cannot start:
 #: it runs before the first launch, and a hang there would hold the caller indefinitely.
@@ -186,36 +185,87 @@ def outer_prefix() -> tuple[str, ...]:
     return tuple(_OUTER_PREFIX)
 
 
-def _service_manager_dirs() -> tuple[str, ...]:
-    """The user's runtime directories that hold a service-manager socket."""
+def _existing_dirs(candidates: Sequence[str]) -> tuple[str, ...]:
     found: list[str] = []
-    for candidate in (os.environ.get("XDG_RUNTIME_DIR", ""), f"/run/user/{os.getuid()}"):
+    for candidate in candidates:
         if not candidate:
             continue
         real = os.path.realpath(candidate)
-        if real not in found and any((Path(real) / s).exists() for s in _SERVICE_MANAGER_SOCKETS):
+        if real not in found and Path(real).is_dir():
             found.append(real)
     return tuple(found)
 
 
-def _terminal_server_dirs() -> tuple[str, ...]:
-    """This user's tmux and screen socket directories that exist."""
+def _service_manager_dirs() -> tuple[str, ...]:
+    """The user's runtime directories.
+
+    Hidden whether or not a bus is there today: rootless Docker and Podman put their sockets
+    in the runtime directory too, and a service manager may start after the launch.
+    """
+    return _existing_dirs([os.environ.get("XDG_RUNTIME_DIR", ""), f"/run/user/{os.getuid()}"])
+
+
+def _named_sockets() -> tuple[str, ...]:
+    """The session bus and the tmux server the environment names, when they are sockets.
+
+    Only the socket itself is masked: its directory can be a shared one such as /tmp
+    (`unix:path=/tmp/dbus-XXXX` where no systemd runs), and hiding that would empty /tmp
+    for the command.
+    """
+    candidates: list[str] = []
+    for address in os.environ.get("DBUS_SESSION_BUS_ADDRESS", "").split(";"):
+        if address.startswith("unix:"):
+            candidates += [f[len("path=") :] for f in address[len("unix:") :].split(",") if f.startswith("path=")]
+    if os.environ.get("TMUX"):
+        candidates.append(os.environ["TMUX"].split(",")[0])
+    found: list[str] = []
+    for candidate in candidates:
+        real = os.path.realpath(candidate)
+        with suppress(OSError):
+            if real not in found and stat.S_ISSOCK(os.lstat(real).st_mode):
+                found.append(real)
+    return tuple(found)
+
+
+def _terminal_server_candidates() -> list[str]:
+    """Where this user's tmux and screen servers keep their sockets, existing or not."""
     uid = os.getuid()
     try:
         user = pwd.getpwuid(uid).pw_name
     except KeyError:
         user = ""
-    candidates = [str(Path(os.environ.get("TMUX_TMPDIR") or "/tmp") / f"tmux-{uid}")]
+    # tmux puts its socket under $TMUX_TMPDIR when set, under /tmp otherwise; the server
+    # the caller runs in may use either, so both are hidden (the one $TMUX names is
+    # masked on its own, `_named_sockets`)
+    candidates = [f"/tmp/tmux-{uid}"]
+    if os.environ.get("TMUX_TMPDIR"):
+        candidates.append(str(Path(os.environ["TMUX_TMPDIR"]) / f"tmux-{uid}"))
     if os.environ.get("SCREENDIR"):
         candidates.append(os.environ["SCREENDIR"])
     if user:
         candidates += [f"/run/screen/S-{user}", f"/var/run/screen/S-{user}"]
-    found: list[str] = []
+    return candidates
+
+
+def _claim_socket_dirs(candidates: Sequence[str]) -> None:
+    """Create the absent socket directories.
+
+    A server that starts during the launch then puts its socket where the mask already
+    is. 0700 owned by this user, which is what tmux and screen create and accept. A
+    parent this user cannot write is left alone.
+    """
     for candidate in candidates:
-        real = os.path.realpath(candidate)
-        if real not in found and Path(real).is_dir():
-            found.append(real)
-    return tuple(found)
+        path = Path(candidate)
+        if candidate and not path.exists() and path.parent.is_dir():
+            with suppress(OSError):
+                path.mkdir(mode=0o700)
+
+
+def _terminal_server_dirs() -> tuple[str, ...]:
+    """This user's tmux and screen socket directories, created where they can be."""
+    candidates = _terminal_server_candidates()
+    _claim_socket_dirs(candidates)
+    return _existing_dirs(candidates)
 
 
 def _hidden_dirs() -> tuple[str, ...]:
@@ -231,26 +281,70 @@ def _find_bwrap() -> str | None:
     return shutil.which("bwrap")
 
 
+def _bound_back(dirs: Sequence[str], keep: Sequence[str]) -> list[str]:
+    """The paths in ``keep`` that fall under a hidden directory, realpath'd, in order."""
+    return [
+        path
+        for path in dict.fromkeys(os.path.realpath(p) for p in keep)
+        if any(Path(path).is_relative_to(hidden) for hidden in dirs)
+    ]
+
+
+def _sockets_under(path: str) -> list[str]:
+    """Every socket file beneath ``path``, symlinks not followed."""
+    found: list[str] = []
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            full = Path(root) / name
+            with suppress(OSError):
+                if stat.S_ISSOCK(full.lstat().st_mode):
+                    found.append(str(full))
+    return found
+
+
+def _loose_sockets(dirs: Sequence[str]) -> list[str]:
+    """The named sockets no hidden directory already covers."""
+    return [s for s in _named_sockets() if not any(Path(s).is_relative_to(d) for d in dirs)]
+
+
 def _bwrap_argv(bwrap: str, dirs: Sequence[str], keep: Sequence[str] = ()) -> list[str]:
     """Bubblewrap argv that keeps the host view and mounts an empty tmpfs over ``dirs``.
 
     A path in ``keep`` that falls under a hidden directory (a workspace or writable root
     under the runtime directory, for one) is bound back on top of the tmpfs, so the
-    command still finds it. Writes there stay governed by the Landlock ruleset.
+    command still finds it. Writes there stay governed by the Landlock ruleset. A socket
+    inside a bound-back path (the bus, when the kept path is the runtime directory's
+    `systemd`) gets /dev/null bound over it, so connecting to it fails, and so does the
+    bus or tmux socket the environment names outside those directories.
     """
     argv = [bwrap, "--bind", "/", "/", "--dev-bind", "/dev", "/dev", "--proc", "/proc"]
     for hidden in dirs:
         argv += ["--tmpfs", hidden]
-    for path in dict.fromkeys(os.path.realpath(p) for p in keep):
-        if any(Path(path).is_relative_to(hidden) for hidden in dirs):
-            argv += ["--bind", path, path]
+    for path in _bound_back(dirs, keep):
+        argv += ["--bind", path, path]
+        for sock in _sockets_under(path):
+            argv += ["--ro-bind", "/dev/null", sock]
+    for sock in _loose_sockets(dirs):
+        argv += ["--ro-bind", "/dev/null", sock]
     return [*argv, "--die-with-parent", "--"]
 
 
-#: Exits 1 when a hidden directory holds anything besides the entries leading to a path
-#: bound back into it. argv[1] is JSON: [[directory, [allowed entry, ...]], ...].
+#: Exits 1, printing what it found, when a hidden directory holds anything besides the
+#: entries leading to a path bound back into it, or a bound-back path or a masked socket
+#: is still a socket. argv[1] is JSON: {"dirs": [[directory, [allowed entry, ...]], ...],
+#: "kept": [bound-back path, ...], "masked": [socket, ...]}.
 _HIDDEN_DIRS_CHECK = (
-    "import json, os, sys; sys.exit(1 if any(set(os.listdir(d)) - set(a) for d, a in json.loads(sys.argv[1])) else 0)"
+    "import json, os, stat, sys\n"
+    "spec = json.loads(sys.argv[1])\n"
+    "def sock(p):\n"
+    "    try: return stat.S_ISSOCK(os.lstat(p).st_mode)\n"
+    "    except OSError: return False\n"
+    "for d, a in spec['dirs']:\n"
+    "    extra = sorted(set(os.listdir(d)) - set(a))\n"
+    "    if extra: print(d, 'still shows', extra); sys.exit(1)\n"
+    "paths = [os.path.join(r, n) for t in spec['kept'] for r, _, f in os.walk(t) for n in f]\n"
+    "for p in paths + spec['masked']:\n"
+    "    if sock(p): print(p, 'is still a socket'); sys.exit(1)\n"
 )
 
 
@@ -258,7 +352,8 @@ def _hidden_dirs_spec(dirs: Sequence[str], keep: Sequence[str] = ()) -> str:
     """The `_HIDDEN_DIRS_CHECK` argument for ``dirs``.
 
     Each directory goes with the first component of every kept path under it: the only
-    entries allowed to show inside the jail.
+    entries allowed to show inside the jail. The bound-back paths are listed too, since
+    none of them may still offer a socket.
     """
     spec = []
     for hidden in dirs:
@@ -270,7 +365,7 @@ def _hidden_dirs_spec(dirs: Sequence[str], keep: Sequence[str] = ()) -> str:
             }
         )
         spec.append([hidden, allowed])
-    return json.dumps(spec)
+    return json.dumps({"dirs": spec, "kept": _bound_back(dirs, keep), "masked": _loose_sockets(dirs)})
 
 
 def _why_not_hidden(dirs: tuple[str, ...]) -> str | None:
@@ -291,7 +386,7 @@ def _why_not_hidden(dirs: tuple[str, ...]) -> str | None:
             except subprocess.TimeoutExpired:
                 reason = f"bubblewrap did not finish a trial run within {_TRIAL_TIMEOUT_S} s"
             else:
-                detail = (trial.stderr or trial.stdout).strip()
+                detail = trial.stdout.strip() or trial.stderr.strip()
                 reason = (
                     None if trial.returncode == 0 else f"bubblewrap could not hide them ({detail or trial.returncode})"
                 )
@@ -300,8 +395,8 @@ def _why_not_hidden(dirs: tuple[str, ...]) -> str | None:
 
 
 def _docker_sockets(hidden: Sequence[str]) -> tuple[str, ...]:
-    """Docker daemon sockets this user can write to and the jail does not hide."""
-    candidates = ["/var/run/docker.sock", "/run/docker.sock"]
+    """Docker and Podman daemon sockets this user can write to and the jail does not hide."""
+    candidates = ["/var/run/docker.sock", "/run/docker.sock", "/run/podman/podman.sock"]
     host = os.environ.get("DOCKER_HOST", "")
     if host.startswith("unix://"):
         candidates.insert(0, host[len("unix://") :])
@@ -327,7 +422,7 @@ def exposure() -> str | None:
     reason = _why_not_hidden(dirs) if dirs else None
     if reason is not None:
         parts.append(
-            f"the jail does not hide {', '.join(dirs)}, which hold sockets of servers that run commands for "
+            f"the jail does not hide {', '.join((*dirs, *_loose_sockets(dirs)))}, which are or hold sockets of servers that run commands for "
             f"this user (the service manager, tmux, screen), and {reason}. A confined command can start "
             "processes outside the jail through them (`systemd-run --user`, `tmux new-window`), so its writes "
             "are no longer confined. Install bubblewrap to close this (Debian/Ubuntu: "
@@ -341,6 +436,13 @@ def exposure() -> str | None:
             f"{sock} is writable by this user: a confined command can drive the Docker daemon, which runs as "
             "root, and escape the jail through it. The jail does not hide it; remove the user from the docker "
             "group, or run where the socket is not writable, to close this."
+        )
+    host = os.environ.get("DOCKER_HOST", "")
+    if host.startswith(("tcp://", "ssh://", "http://", "https://")):
+        parts.append(
+            f"DOCKER_HOST points at a Docker daemon over the network ({host.split('://')[0]}): the jail does not "
+            "govern network connections, so a confined command that reaches that daemon can escape the jail "
+            "through it. Unset DOCKER_HOST, or put the daemon where this user cannot reach it, to close this."
         )
     return " Also: ".join(parts) if parts else None
 
@@ -459,7 +561,9 @@ class LandlockContainmentBackend:
 
         # (0) where hiding is in effect, check it inside the real jail. Runs first: a
         # bubblewrap that failed to start exits non-zero, which step (1) would read as a
-        # denied write. Where hiding is not possible, `exposure` reports it.
+        # denied write. A check that fails (an entry or a socket still reachable) marks
+        # hiding as failed for these directories: the launches that follow run without
+        # bubblewrap and with the warning, like a host where it cannot start.
         hidden = _hidden_dirs()
         if hidden and _why_not_hidden(hidden) is None:
             kept = (str(wd), *json.loads(profile or "[]"))
@@ -472,10 +576,11 @@ class LandlockContainmentBackend:
             if done.returncode == _CONFINE_FAILED_RC:
                 raise JailNotEstablished("fail-closed: Landlock confinement could not be established")
             if done.returncode != 0:
-                detail = (done.stderr or done.stdout).strip()
-                raise JailNotEstablished(
-                    f"fail-closed: a command server's socket is reachable inside the jail ({detail})"
+                detail = done.stdout.strip() or done.stderr.strip()
+                _HIDING_WORKS[hidden] = (
+                    f"a command server's socket was still reachable inside the jail ({detail or done.returncode})"
                 )
+                warnings.warn(exposure() or "", JailExposureWarning, stacklevel=2)
 
         # (1) liveness: a write OUTSIDE the workspace must be denied.
         if not _denied(wd.parent / ".jail-probe"):
