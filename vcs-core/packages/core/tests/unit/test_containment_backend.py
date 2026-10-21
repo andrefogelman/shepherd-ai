@@ -222,6 +222,31 @@ def test_seatbelt_profile_denies_both_tmux_directories_resolved(tmp_path, monkey
     assert f'(subpath "{os.path.realpath(tmp_path / "cur")}")' not in profile
 
 
+def test_seatbelt_denies_nothing_through_a_symlink_planted_at_the_tmux_directory(tmp_path, monkeypatch) -> None:
+    """Another user can put a symlink at /tmp/tmux-<uid>; the rule must not follow it."""
+    target = tmp_path / "somewhere"
+    target.mkdir()
+    (tmp_path / f"tmux-{os.getuid()}").symlink_to(target)
+    monkeypatch.setenv("TMUX_TMPDIR", str(tmp_path))
+    profile = SeatbeltContainmentBackend().profile_for((), allow_network=True)
+    assert os.path.realpath(target) not in profile
+    assert f'(subpath "{os.path.realpath(tmp_path)}/tmux-{os.getuid()}")' not in profile
+
+
+def test_seatbelt_skips_a_directory_another_user_owns(tmp_path, monkeypatch) -> None:
+    mine = tmp_path / "screens"
+    mine.mkdir()
+    real = os.path.realpath(mine)
+    assert seatbelt._own_paths([str(mine)], seatbelt.stat.S_ISDIR) == (real,)
+    uid = os.getuid()
+    monkeypatch.setattr(seatbelt.os, "getuid", lambda: uid + 1)
+    assert seatbelt._own_paths([str(mine)], seatbelt.stat.S_ISDIR) == ()
+    # an absent directory keeps its rule: a server started later creates it there
+    assert seatbelt._own_paths([str(tmp_path / "absent")], seatbelt.stat.S_ISDIR) == (
+        os.path.realpath(tmp_path / "absent"),
+    )
+
+
 @_macos
 def test_seatbelt_refuses_a_connect_to_a_tmux_socket(monkeypatch) -> None:
     """`(allow default)` lets a sandboxed command reach any Unix socket; a tmux server there

@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any
 from vcs_core._containment import JailNotEstablished
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
 # Landlock raw syscalls (same numbers on x86_64 and aarch64); glibc lacks wrappers pre-2.36.
 _NR_CREATE_RULESET, _NR_ADD_RULE, _NR_RESTRICT_SELF = 444, 445, 446
@@ -70,6 +70,11 @@ _OUTER_PREFIX: list[str] = []
 #: Whether bubblewrap could hide each tuple of directories, keyed by that tuple. Decided
 #: once per process: a trial run costs a namespace setup on every launch otherwise.
 _HIDING_WORKS: dict[tuple[str, ...], str | None] = {}
+
+#: The sockets beneath each path bound back into a hidden directory, keyed by that path.
+#: Walked once per process: a workspace under a hidden directory can be a large tree,
+#: and every launch would walk it again. A socket created there later is not masked.
+_SOCKETS_UNDER: dict[str, tuple[str, ...]] = {}
 
 
 class JailExposureWarning(RuntimeWarning):
@@ -185,14 +190,27 @@ def outer_prefix() -> tuple[str, ...]:
     return tuple(_OUTER_PREFIX)
 
 
+def _own_entry(candidate: str, is_kind: Callable[[int], bool]) -> str | None:
+    """``candidate`` with its parent resolved, if this user owns it and it is that kind.
+
+    None otherwise. The last component is not followed: another user can plant a symlink at
+    /tmp/tmux-<uid>, and following it would put the mask over whatever it points at.
+    tmux and screen refuse a socket directory this user does not own, for the same reason.
+    """
+    path = Path(os.path.realpath(Path(candidate).parent)) / Path(candidate).name
+    try:
+        st = path.lstat()
+    except OSError:
+        return None
+    return str(path) if is_kind(st.st_mode) and st.st_uid == os.getuid() else None
+
+
 def _existing_dirs(candidates: Sequence[str]) -> tuple[str, ...]:
     found: list[str] = []
     for candidate in candidates:
-        if not candidate:
-            continue
-        real = os.path.realpath(candidate)
-        if real not in found and Path(real).is_dir():
-            found.append(real)
+        own = _own_entry(candidate, stat.S_ISDIR) if candidate else None
+        if own is not None and own not in found:
+            found.append(own)
     return tuple(found)
 
 
@@ -220,10 +238,9 @@ def _named_sockets() -> tuple[str, ...]:
         candidates.append(os.environ["TMUX"].split(",")[0])
     found: list[str] = []
     for candidate in candidates:
-        real = os.path.realpath(candidate)
-        with suppress(OSError):
-            if real not in found and stat.S_ISSOCK(os.lstat(real).st_mode):
-                found.append(real)
+        own = _own_entry(candidate, stat.S_ISSOCK) if candidate else None
+        if own is not None and own not in found:
+            found.append(own)
     return tuple(found)
 
 
@@ -290,16 +307,24 @@ def _bound_back(dirs: Sequence[str], keep: Sequence[str]) -> list[str]:
     ]
 
 
-def _sockets_under(path: str) -> list[str]:
-    """Every socket file beneath ``path``, symlinks not followed."""
-    found: list[str] = []
-    for root, _dirs, files in os.walk(path):
-        for name in files:
-            full = Path(root) / name
-            with suppress(OSError):
-                if stat.S_ISSOCK(full.lstat().st_mode):
-                    found.append(str(full))
-    return found
+def _sockets_under(path: str) -> tuple[str, ...]:
+    """Every socket file beneath ``path``, symlinks not followed (`_SOCKETS_UNDER`)."""
+    if path not in _SOCKETS_UNDER:
+        found: list[str] = []
+        for root, _dirs, files in os.walk(path):
+            for name in files:
+                full = Path(root) / name
+                with suppress(OSError):
+                    if stat.S_ISSOCK(full.lstat().st_mode):
+                        found.append(str(full))
+        _SOCKETS_UNDER[path] = tuple(found)
+    return _SOCKETS_UNDER[path]
+
+
+def _masked_sockets(dirs: Sequence[str], keep: Sequence[str] = ()) -> list[str]:
+    """Every socket that gets /dev/null over it: inside a bound-back path, or named."""
+    inside = [sock for path in _bound_back(dirs, keep) for sock in _sockets_under(path)]
+    return [*inside, *_loose_sockets(dirs)]
 
 
 def _loose_sockets(dirs: Sequence[str]) -> list[str]:
@@ -322,17 +347,14 @@ def _bwrap_argv(bwrap: str, dirs: Sequence[str], keep: Sequence[str] = ()) -> li
         argv += ["--tmpfs", hidden]
     for path in _bound_back(dirs, keep):
         argv += ["--bind", path, path]
-        for sock in _sockets_under(path):
-            argv += ["--ro-bind", "/dev/null", sock]
-    for sock in _loose_sockets(dirs):
+    for sock in _masked_sockets(dirs, keep):
         argv += ["--ro-bind", "/dev/null", sock]
     return [*argv, "--die-with-parent", "--"]
 
 
 #: Exits 1, printing what it found, when a hidden directory holds anything besides the
-#: entries leading to a path bound back into it, or a bound-back path or a masked socket
-#: is still a socket. argv[1] is JSON: {"dirs": [[directory, [allowed entry, ...]], ...],
-#: "kept": [bound-back path, ...], "masked": [socket, ...]}.
+#: entries leading to a path bound back into it, or a masked socket is still a socket.
+#: argv[1] is JSON: {"dirs": [[directory, [allowed entry, ...]], ...], "masked": [socket, ...]}.
 _HIDDEN_DIRS_CHECK = (
     "import json, os, stat, sys\n"
     "spec = json.loads(sys.argv[1])\n"
@@ -342,8 +364,7 @@ _HIDDEN_DIRS_CHECK = (
     "for d, a in spec['dirs']:\n"
     "    extra = sorted(set(os.listdir(d)) - set(a))\n"
     "    if extra: print(d, 'still shows', extra); sys.exit(1)\n"
-    "paths = [os.path.join(r, n) for t in spec['kept'] for r, _, f in os.walk(t) for n in f]\n"
-    "for p in paths + spec['masked']:\n"
+    "for p in spec['masked']:\n"
     "    if sock(p): print(p, 'is still a socket'); sys.exit(1)\n"
 )
 
@@ -352,8 +373,8 @@ def _hidden_dirs_spec(dirs: Sequence[str], keep: Sequence[str] = ()) -> str:
     """The `_HIDDEN_DIRS_CHECK` argument for ``dirs``.
 
     Each directory goes with the first component of every kept path under it: the only
-    entries allowed to show inside the jail. The bound-back paths are listed too, since
-    none of them may still offer a socket.
+    entries allowed to show inside the jail. The masked sockets are listed too, since
+    none of them may still be one.
     """
     spec = []
     for hidden in dirs:
@@ -365,7 +386,7 @@ def _hidden_dirs_spec(dirs: Sequence[str], keep: Sequence[str] = ()) -> str:
             }
         )
         spec.append([hidden, allowed])
-    return json.dumps({"dirs": spec, "kept": _bound_back(dirs, keep), "masked": _loose_sockets(dirs)})
+    return json.dumps({"dirs": spec, "masked": _masked_sockets(dirs, keep)})
 
 
 def _why_not_hidden(dirs: tuple[str, ...]) -> str | None:

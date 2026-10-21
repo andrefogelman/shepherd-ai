@@ -190,6 +190,7 @@ def test_landlock_blocks_a_write_through_systemd_run(tmp_path) -> None:
 def fresh_hiding(monkeypatch):
     """Each test decides bubblewrap's fate afresh and leaves no outer prefix behind."""
     monkeypatch.setattr(landlock, "_HIDING_WORKS", {})
+    monkeypatch.setattr(landlock, "_SOCKETS_UNDER", {})
     yield
     landlock.set_outer_prefix([])
 
@@ -436,6 +437,69 @@ def test_landlock_creates_an_absent_tmux_directory_private(tmp_path, monkeypatch
 def test_landlock_leaves_a_parent_it_cannot_write(tmp_path) -> None:
     landlock._claim_socket_dirs([str(tmp_path / "absent-parent" / "tmux-1")])
     assert not (tmp_path / "absent-parent").exists()
+
+
+def test_landlock_does_not_follow_a_symlink_planted_at_the_tmux_directory(tmp_path, monkeypatch) -> None:
+    """/tmp is shared: another user can put a symlink at /tmp/tmux-<uid>. Following it
+    would hide whatever it points at, so neither the link nor its target is masked."""
+    tmux_tmp = tmp_path / "tmuxtmp"
+    tmux_tmp.mkdir()
+    target = tmp_path / "somewhere"
+    target.mkdir()
+    (tmux_tmp / f"tmux-{os.getuid()}").symlink_to(target)
+    monkeypatch.setenv("TMUX_TMPDIR", str(tmux_tmp))
+    dirs = landlock._terminal_server_dirs()
+    assert str(tmux_tmp / f"tmux-{os.getuid()}") not in dirs
+    assert str(target) not in dirs
+    assert list(target.iterdir()) == []
+
+
+def test_landlock_skips_a_directory_another_user_owns(tmp_path, monkeypatch) -> None:
+    """tmux and screen refuse a socket directory they do not own; so does the mask."""
+    mine = tmp_path / "mine"
+    mine.mkdir()
+    assert landlock._existing_dirs([str(mine)]) == (str(mine),)
+    uid = os.getuid()
+    monkeypatch.setattr(landlock.os, "getuid", lambda: uid + 1)
+    assert landlock._existing_dirs([str(mine)]) == ()
+
+
+def test_landlock_does_not_follow_a_symlink_named_as_the_tmux_socket(tmp_path, monkeypatch) -> None:
+    current = tmp_path / "current"
+    current.mkdir()
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        server.bind(str(tmp_path / "real"))
+        (current / "default").symlink_to(tmp_path / "real")
+        monkeypatch.setenv("TMUX", f"{current}/default,1234,0")
+        named = landlock._named_sockets()
+        assert str(tmp_path / "real") not in named
+        assert str(current / "default") not in named
+    finally:
+        server.close()
+
+
+def test_landlock_walks_each_kept_path_once(tmp_path, monkeypatch) -> None:
+    """A workspace under a hidden directory can be a large tree; launches after the first
+    take its sockets from the first walk."""
+    monkeypatch.setattr(landlock, "_SOCKETS_UNDER", {})
+    walks: list[str] = []
+    real_walk = os.walk
+
+    def counted(path, *args, **kwargs):
+        walks.append(str(path))
+        return real_walk(path, *args, **kwargs)
+
+    monkeypatch.setattr(landlock.os, "walk", counted)
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        server.bind(str(tmp_path / "s"))
+        first = landlock._sockets_under(str(tmp_path))
+        second = landlock._sockets_under(str(tmp_path))
+    finally:
+        server.close()
+    assert first == second == (str(tmp_path / "s"),)
+    assert walks == [str(tmp_path)]
 
 
 def test_landlock_masks_a_socket_inside_a_bound_back_path(tmp_path, monkeypatch, fresh_hiding) -> None:

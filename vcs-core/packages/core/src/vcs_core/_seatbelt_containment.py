@@ -11,6 +11,7 @@ Internal runtime surface — not part of the frozen consumer SPI.
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 import sys
 from contextlib import suppress
@@ -20,9 +21,31 @@ from typing import TYPE_CHECKING, Any
 from vcs_core._containment import JailNotEstablished
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
 _DEV = '(allow file-write* (subpath "/dev"))'  # /dev/null etc. — not the workspace
+
+
+def _own_or_absent(candidate: str, is_kind: Callable[[int], bool]) -> str | None:
+    """``candidate`` with its parent resolved, unless something else sits there.
+
+    Something else is an entry of another kind or one this user does not own. Seatbelt matches resolved paths, so the parent is resolved; the last component is not
+    followed, since another user can plant a symlink at /tmp/tmux-<uid>. An absent entry
+    keeps its rule: a server started after the launch creates it there.
+    """
+    path = Path(os.path.realpath(Path(candidate).parent)) / Path(candidate).name
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        return str(path)
+    except OSError:
+        return None
+    return str(path) if is_kind(st.st_mode) and st.st_uid == os.getuid() else None
+
+
+def _own_paths(candidates: Sequence[str], is_kind: Callable[[int], bool]) -> tuple[str, ...]:
+    found = (_own_or_absent(c, is_kind) for c in candidates if c)
+    return tuple(dict.fromkeys(p for p in found if p is not None))
 
 
 def _terminal_server_dirs() -> tuple[str, ...]:
@@ -40,7 +63,7 @@ def _terminal_server_dirs() -> tuple[str, ...]:
         candidates.append(os.environ["SCREENDIR"])
     if os.environ.get("TMPDIR"):
         candidates.append(str(Path(os.environ["TMPDIR"]) / ".screen"))
-    return tuple(dict.fromkeys(os.path.realpath(c) for c in candidates if c))
+    return _own_paths(candidates, stat.S_ISDIR)
 
 
 def _named_sockets() -> tuple[str, ...]:
@@ -54,7 +77,7 @@ def _named_sockets() -> tuple[str, ...]:
             candidates += [f[len("path=") :] for f in address[len("unix:") :].split(",") if f.startswith("path=")]
     if os.environ.get("TMUX"):
         candidates.append(os.environ["TMUX"].split(",")[0])
-    return tuple(dict.fromkeys(os.path.realpath(c) for c in candidates if c))
+    return _own_paths(candidates, stat.S_ISSOCK)
 
 
 def _docker_sockets() -> tuple[str, ...]:
