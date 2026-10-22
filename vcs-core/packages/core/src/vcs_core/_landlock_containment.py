@@ -614,6 +614,17 @@ def exposure() -> str | None:
     return " Also: ".join(parts) if parts else None
 
 
+def _exposure_warning() -> str:
+    """`exposure()` for a warning raised during a launch.
+
+    A failure to describe the exposure must not stop the launch it warns about.
+    """
+    try:
+        return exposure() or ""
+    except OSError as error:
+        return f"the jail could not tell what it leaves reachable ({error}); running without that report."
+
+
 def service_manager_exposure() -> str | None:
     """Same as `exposure` (the 0.3.6 name)."""
     return exposure()
@@ -626,7 +637,7 @@ def _hiding_argv(keep: Sequence[str] = ()) -> list[str]:
         return []
     bwrap = _find_bwrap()
     if bwrap is None or _why_not_hidden(dirs) is not None:
-        warnings.warn(exposure() or "", JailExposureWarning, stacklevel=3)
+        warnings.warn(_exposure_warning(), JailExposureWarning, stacklevel=3)
         return []
     return _bwrap_argv(bwrap, dirs, keep)
 
@@ -753,7 +764,7 @@ class LandlockContainmentBackend:
                 _HIDING_WORKS[hidden] = (
                     f"a command server's socket was still reachable inside the jail ({detail or done.returncode})"
                 )
-                warnings.warn(exposure() or "", JailExposureWarning, stacklevel=2)
+                warnings.warn(_exposure_warning(), JailExposureWarning, stacklevel=2)
             else:
                 _KEPT_WALKED.add((hidden, kept))
 

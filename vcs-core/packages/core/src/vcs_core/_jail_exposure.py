@@ -9,6 +9,8 @@ without root, for the backends to report; nothing here blocks a launch.
 
 from __future__ import annotations
 
+import errno
+import fnmatch
 import json
 import os
 import pwd
@@ -52,6 +54,8 @@ _HOST_KEY_ALIAS = "jail-exposure-loopback"
 #: later); the second is the debug1 line of older releases.
 _AUTHENTICATED = re.compile(rb"Authenticated to |Authentication succeeded")
 _SSH_TIMEOUT_S = 10
+#: How long `agent_sockets` waits for an agent's socket to accept a connection.
+_AGENT_CONNECT_TIMEOUT_S = 0.5
 
 # The login is tried once per process: exposure is computed again on launches where
 # hiding fails, and each try is a line in the host's auth log.
@@ -387,13 +391,15 @@ def _try_ssh_logins() -> bool:
 def _agent_socket_patterns() -> list[str]:
     """Where ssh agents put their socket when started without a path of the user's choosing.
 
-    OpenSSH's ssh-agent (under /tmp or $TMPDIR), launchd's on macOS, gpg-agent's ssh
+    OpenSSH's ssh-agent (under ~/.ssh/agent since 10.1, under /tmp or $TMPDIR before or
+    with -T), launchd's on macOS, gpg-agent's ssh
     socket, 1Password, Bitwarden and Secretive. An agent started with ``-a`` elsewhere is
     not found here.
     """
     env, home_dir, uid = environ(), home(), os.getuid()
     temps = dict.fromkeys(t.rstrip("/") for t in ("/tmp", env.get("TMPDIR", "")) if t)
-    patterns = [f"{t}/ssh-*/agent.*" for t in temps]
+    patterns = [str(home_dir / ".ssh" / "agent" / "s.*")]  # OpenSSH 10.1 and later, and sshd's forwarded agents
+    patterns += [f"{t}/ssh-*/agent.*" for t in temps]
     patterns.append("/private/tmp/com.apple.launchd.*/Listeners")
     gnupg = env.get("GNUPGHOME") or str(home_dir / ".gnupg")
     patterns.append(f"{gnupg}/S.gpg-agent.ssh")
@@ -409,23 +415,48 @@ def _agent_socket_patterns() -> list[str]:
 
 
 def _matches(pattern: str) -> list[str]:
-    """The paths matching an absolute ``pattern``.
+    """The paths matching an absolute ``pattern``, where `*` in a component is a wildcard.
 
-    Only the components from the first one holding `*` on are a pattern: a home or
-    TMPDIR holding `[` is taken as written.
+    Walked one directory at a time: an entry that cannot be read is skipped instead of
+    ending the walk (pathlib's glob on Python 3.11 stops at the first one), and a wildcard
+    never matches a link to a directory, which another user can plant in /tmp. A
+    component without `*` is taken as written, `[` included.
     """
     parts = Path(pattern).parts
-    first = next((i for i, part in enumerate(parts) if "*" in part), None)
-    if first is None:
-        return [pattern]
-    return sorted(str(path) for path in Path(*parts[:first]).glob("/".join(parts[first:])))
+    found = [parts[0]]
+    for depth, part in enumerate(parts[1:], 1):
+        last = depth == len(parts) - 1
+        if "*" not in part:
+            found = [str(Path(base) / part) for base in found]
+            continue
+        matched: list[str] = []
+        for base in found:
+            with suppress(OSError), os.scandir(base) as entries:
+                for entry in entries:
+                    with suppress(OSError):
+                        if fnmatch.fnmatchcase(entry.name, part) and (last or entry.is_dir(follow_symlinks=False)):
+                            matched.append(entry.path)
+        found = matched
+    return sorted(found)
+
+
+def _listening(path: str) -> bool:
+    """False only when nothing listens at the socket ``path`` (an agent that died and left it)."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+        probe.settimeout(_AGENT_CONNECT_TIMEOUT_S)
+        try:
+            probe.connect(path)
+        except OSError as error:
+            return error.errno not in (errno.ECONNREFUSED, errno.ENOENT)
+    return True
 
 
 def agent_sockets() -> list[str]:
     """The ssh agent sockets this user owns at the places `_agent_socket_patterns` names, resolved.
 
-    A link is not followed: another user could plant one, and a socket of this user's
-    reached through it is found at its own place or not at all.
+    The socket itself is never a link: another user could plant one. A socket nothing
+    listens at is left out; one that cannot be tried (a path too long to connect to, a
+    timeout) is kept.
     """
     found: list[str] = []
     for pattern in _agent_socket_patterns():
@@ -433,7 +464,7 @@ def agent_sockets() -> list[str]:
             with suppress(OSError):
                 st = os.lstat(path)
                 real = os.path.realpath(path)
-                if stat.S_ISSOCK(st.st_mode) and st.st_uid == os.getuid() and real not in found:
+                if stat.S_ISSOCK(st.st_mode) and st.st_uid == os.getuid() and real not in found and _listening(real):
                     found.append(real)
     return found
 
@@ -441,7 +472,8 @@ def agent_sockets() -> list[str]:
 def agent_message(paths: Sequence[str], jail: str) -> str:
     """The report for agent sockets left reachable, worded for ``jail`` ("jail", "sandbox")."""
     return (
-        f"ssh agent sockets that SSH_AUTH_SOCK does not name stay reachable ({', '.join(paths)}): a confined "
+        f"ssh agent sockets that SSH_AUTH_SOCK does not name stay reachable "
+        f"({', '.join(p if p.isprintable() else repr(p) for p in paths)}): a confined "
         f"command can connect to one and sign with this user's keys. The {jail} hides only the agent "
         "SSH_AUTH_SOCK names. Stop the agents this run does not need, to close this."
     )

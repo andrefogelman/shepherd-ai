@@ -281,8 +281,10 @@ def test_resolve_programs_keeps_the_environment_the_checks_read(tmp_path, monkey
 
 
 def test_agent_sockets_finds_this_users_agents_where_they_put_them(monkeypatch) -> None:
-    """An agent SSH_AUTH_SOCK does not name is still on disk: OpenSSH's under $TMPDIR,
-    1Password's under the home. A file there that is not a socket, and a link, are not one."""
+    """An agent SSH_AUTH_SOCK does not name is still on disk: OpenSSH's under ~/.ssh/agent
+    (10.1 and later) or $TMPDIR, 1Password's under the home. A file there that is not a
+    socket, a link, a socket nothing listens at, and an agent behind a planted directory
+    link are not reported; a directory that cannot be read does not end the walk."""
     short = Path(tempfile.mkdtemp(prefix="ag", dir="/tmp"))  # sun_path is 104 bytes on macOS
     servers: list[socket.socket] = []
     try:
@@ -290,24 +292,42 @@ def test_agent_sockets_finds_this_users_agents_where_they_put_them(monkeypatch) 
         (home / ".1password").mkdir(parents=True)
         (home / ".gnupg").mkdir()
         (tmp / "ssh-abc").mkdir(parents=True)
+        (home / ".ssh" / "agent").mkdir(parents=True)
+        (tmp / "ssh-aaa").mkdir(mode=0o000)
+        (short / "elsewhere").mkdir()
+        (tmp / "ssh-lnk").symlink_to(short / "elsewhere")
         monkeypatch.setenv("HOME", str(home))
         monkeypatch.setenv("TMPDIR", str(tmp))
         monkeypatch.delenv("GNUPGHOME", raising=False)
-        agents = [tmp / "ssh-abc" / "agent.7", home / ".1password" / "agent.sock"]
-        for path in agents:
+        agents = [home / ".ssh" / "agent" / "s.x1", tmp / "ssh-abc" / "agent.7", home / ".1password" / "agent.sock"]
+        behind_link = short / "elsewhere" / "agent.5"
+        for path in (*agents, behind_link):
             server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             server.bind(str(path))
+            server.listen(1)
             servers.append(server)
+        dead = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        dead.bind(str(tmp / "ssh-abc" / "agent.9"))
+        dead.close()
         (home / ".gnupg" / "S.gpg-agent.ssh").write_text("")
         (home / ".bitwarden-ssh-agent.sock").symlink_to(agents[0])
         found = exposure.agent_sockets()
         for path in agents:
             assert found.count(os.path.realpath(path)) == 1, found
         assert not any(f.startswith(os.path.realpath(home / ".gnupg")) for f in found)
+        assert os.path.realpath(tmp / "ssh-abc" / "agent.9") not in found
+        assert os.path.realpath(behind_link) not in found
     finally:
         for server in servers:
             server.close()
+        (short / "t" / "ssh-aaa").chmod(0o700)
         shutil.rmtree(short, ignore_errors=True)
+
+
+def test_agent_message_escapes_a_path_that_is_not_printable() -> None:
+    message = exposure.agent_message(["/tmp/ssh-a/agent.1", "/tmp/ssh-\x1b[31m/agent.2"], "jail")
+    assert "/tmp/ssh-a/agent.1, '/tmp/ssh-\\x1b[31m/agent.2'" in message
+    assert "\x1b" not in message
 
 
 def test_resolve_programs_skips_relative_entries_of_the_path(tmp_path, monkeypatch) -> None:

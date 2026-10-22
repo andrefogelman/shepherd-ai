@@ -1010,3 +1010,11 @@ def test_landlock_masks_the_named_sockets_with_no_directory_to_hide(tmp_path, mo
         assert done.stdout.strip() == "refused"
     finally:
         server.close()
+
+
+def test_a_launch_warning_survives_an_exposure_that_cannot_be_described(monkeypatch) -> None:
+    def broken() -> str:
+        raise FileNotFoundError(2, "gone", "/tmp/ssh-x")
+
+    monkeypatch.setattr(landlock, "exposure", broken)
+    assert "could not tell what it leaves reachable" in landlock._exposure_warning()
