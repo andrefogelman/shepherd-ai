@@ -81,8 +81,18 @@ def resolve_programs() -> dict[str, str | None]:
         _ENVIRON = dict(os.environ)
     for name in _PROGRAM_NAMES:
         if name not in _PROGRAMS:
-            _PROGRAMS[name] = shutil.which(name, path=_ENVIRON.get("PATH"))
+            _PROGRAMS[name] = shutil.which(name, path=absolute_path(_ENVIRON.get("PATH")))
     return dict(_PROGRAMS)
+
+
+def absolute_path(value: str | None) -> str:
+    """``value``, a PATH, with only its absolute entries (`os.defpath` when there is none).
+
+    `shutil.which` reads an empty or relative entry as the current directory, which may be
+    a repository's, and a bare name it returns is looked up again on the PATH of the moment.
+    """
+    entries = (os.defpath if value is None else value).split(os.pathsep)
+    return os.pathsep.join(entry for entry in entries if Path(entry).is_absolute())
 
 
 def environ() -> Mapping[str, str]:

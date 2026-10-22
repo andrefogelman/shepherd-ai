@@ -308,3 +308,17 @@ def test_agent_sockets_finds_this_users_agents_where_they_put_them(monkeypatch) 
         for server in servers:
             server.close()
         shutil.rmtree(short, ignore_errors=True)
+
+
+def test_resolve_programs_skips_relative_entries_of_the_path(tmp_path, monkeypatch) -> None:
+    """An empty or relative PATH entry is the current directory, which may be a repository's."""
+    monkeypatch.setattr(exposure, "_PROGRAMS", {})
+    repo, tools = tmp_path / "repo", tmp_path / "tools"
+    for directory in (repo, tools):
+        directory.mkdir()
+        (directory / "bwrap").write_text("#!/bin/sh\n")
+        (directory / "bwrap").chmod(0o755)
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("PATH", f":.:{tools}")
+    assert exposure.resolve_programs()["bwrap"] == str(tools / "bwrap")
+    assert exposure.absolute_path(None) == os.defpath
