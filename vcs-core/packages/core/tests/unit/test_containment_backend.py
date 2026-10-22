@@ -308,7 +308,7 @@ def test_seatbelt_refuses_a_connect_to_a_tmux_socket(monkeypatch) -> None:
 
 
 def test_seatbelt_reports_docker_reachable(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(seatbelt.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("DOCKER_HOST", raising=False)
     monkeypatch.setenv("DOCKER_CONFIG", str(tmp_path / "cfg"))
     monkeypatch.setattr(_jail_exposure, "docker_network_endpoints", list)
@@ -331,7 +331,7 @@ def test_seatbelt_reports_docker_reachable(tmp_path, monkeypatch) -> None:
 @_macos
 def test_seatbelt_reports_a_docker_context_and_an_ssh_login(tmp_path, monkeypatch) -> None:
     """The same two ways out Linux reports: a context's socket, and a login to this host's sshd."""
-    monkeypatch.setattr(seatbelt.Path, "home", staticmethod(lambda: tmp_path / "home"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.delenv("DOCKER_HOST", raising=False)
     monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
     monkeypatch.setenv("DOCKER_CONFIG", str(tmp_path / "cfg"))

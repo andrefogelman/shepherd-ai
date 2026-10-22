@@ -18,6 +18,12 @@ import pytest
 from vcs_core import _jail_exposure as exposure
 
 
+@pytest.fixture(autouse=True)
+def live_environment(monkeypatch):
+    """Each test reads the environment it sets, not one a resolve_programs call kept earlier."""
+    monkeypatch.setattr(exposure, "_ENVIRON", None, raising=False)
+
+
 def test_dbus_addresses_split_paths_from_abstract_names_and_decode_them() -> None:
     value = "unix:path=/run/user/1000/bus;unix:abstract=/tmp/dbus-X,guid=1;tcp:host=h;unix:path=/a%20b%7ec"
     assert exposure.dbus_addresses(value) == (["/run/user/1000/bus", "/a b~c"], ["/tmp/dbus-X"])
@@ -33,7 +39,7 @@ def _context(config: Path, name: str, host: str) -> None:
 def test_docker_contexts_and_per_user_sockets_are_candidates(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("DOCKER_CONFIG", str(tmp_path / "cfg"))
     monkeypatch.setenv("DOCKER_HOST", "unix:///from/env.sock")
-    monkeypatch.setattr(exposure.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
     _context(tmp_path / "cfg", "desktop-linux", "unix:///home/u/.docker/desktop/docker.sock")
     _context(tmp_path / "cfg", "remote", "ssh://u@far")
     (tmp_path / "cfg" / "contexts" / "meta" / "broken").mkdir()
@@ -239,3 +245,28 @@ def test_programs_resolved_first_ignore_a_path_set_later(tmp_path, monkeypatch) 
     assert exposure.program("bwrap") == str(real / "bwrap")
     assert exposure.program("ssh") == str(real / "ssh")
     assert exposure.resolve_programs()["bwrap"] == str(real / "bwrap")  # kept, not looked up again
+
+
+def test_resolve_programs_keeps_the_environment_the_checks_read(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(exposure, "_PROGRAMS", {})
+    home = tmp_path / "home"
+    planted = tmp_path / "planted"
+    _context(home / ".docker", "desktop", f"unix://{home}/docker.sock")
+    _context(planted, "planted", f"unix://{planted}/docker.sock")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("DOCKER_CONFIG", raising=False)
+    monkeypatch.setenv("DOCKER_HOST", "unix:///run/user-docker.sock")
+    exposure.resolve_programs()
+    # a repository's settings, put in this process's environment after the call
+    monkeypatch.setenv("HOME", str(tmp_path / "elsewhere"))
+    monkeypatch.setenv("DOCKER_CONFIG", str(planted))
+    monkeypatch.delenv("DOCKER_HOST")
+    assert exposure.home() == home
+    assert exposure.environ()["DOCKER_HOST"] == "unix:///run/user-docker.sock"
+    assert exposure.docker_context_hosts() == [f"unix://{home}/docker.sock"]
+    candidates = exposure.docker_socket_candidates()
+    assert "/run/user-docker.sock" in candidates
+    assert str(home / "docker.sock") in candidates
+    assert not any(c.startswith(str(planted)) for c in candidates)
+    monkeypatch.setattr(exposure, "_ENVIRON", None)  # not resolved first: the live values
+    assert exposure.docker_context_hosts() == [f"unix://{planted}/docker.sock"]

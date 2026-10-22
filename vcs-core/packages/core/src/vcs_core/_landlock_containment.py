@@ -252,7 +252,7 @@ def _service_manager_dirs() -> tuple[str, ...]:
 
 
 def _runtime_dir_candidates() -> list[str]:
-    return [os.environ.get("XDG_RUNTIME_DIR", ""), f"/run/user/{os.getuid()}"]
+    return [_jail_exposure.environ().get("XDG_RUNTIME_DIR", ""), f"/run/user/{os.getuid()}"]
 
 
 def _named_sockets() -> tuple[str, ...]:
@@ -271,9 +271,9 @@ def _named_sockets() -> tuple[str, ...]:
 
 
 def _named_socket_candidates() -> list[str]:
-    candidates = _jail_exposure.dbus_addresses(os.environ.get("DBUS_SESSION_BUS_ADDRESS", ""))[0]
-    if os.environ.get("TMUX"):
-        candidates.append(os.environ["TMUX"].split(",")[0])
+    candidates = _jail_exposure.dbus_addresses(_jail_exposure.environ().get("DBUS_SESSION_BUS_ADDRESS", ""))[0]
+    if _jail_exposure.environ().get("TMUX"):
+        candidates.append(_jail_exposure.environ()["TMUX"].split(",")[0])
     return candidates
 
 
@@ -288,10 +288,10 @@ def _terminal_server_candidates() -> list[str]:
     # the caller runs in may use either, so both are hidden (the one $TMUX names is
     # masked on its own, `_named_sockets`)
     candidates = [f"/tmp/tmux-{uid}"]
-    if os.environ.get("TMUX_TMPDIR"):
-        candidates.append(str(Path(os.environ["TMUX_TMPDIR"]) / f"tmux-{uid}"))
-    if os.environ.get("SCREENDIR"):
-        candidates.append(os.environ["SCREENDIR"])
+    if _jail_exposure.environ().get("TMUX_TMPDIR"):
+        candidates.append(str(Path(_jail_exposure.environ()["TMUX_TMPDIR"]) / f"tmux-{uid}"))
+    if _jail_exposure.environ().get("SCREENDIR"):
+        candidates.append(_jail_exposure.environ()["SCREENDIR"])
     if user:
         candidates += [f"/run/screen/S-{user}", f"/var/run/screen/S-{user}"]
     return candidates
@@ -515,7 +515,7 @@ def _x_displays() -> tuple[str, ...]:
     found: list[str] = []
     with suppress(OSError), os.scandir(_X11_DIR) as entries:
         found += sorted(e.path for e in entries if _is_socket(e.path) and os.access(e.path, os.W_OK))
-    display = os.environ.get("DISPLAY", "")
+    display = _jail_exposure.environ().get("DISPLAY", "")
     if display.split(":")[0] not in ("", "unix"):
         found.append(f"DISPLAY={display}")
     return tuple(found)
@@ -552,7 +552,7 @@ def exposure() -> str | None:
             "root, and escape the jail through it. The jail does not hide it; remove the user from the docker "
             "group, or run where the socket is not writable, to close this."
         )
-    host = os.environ.get("DOCKER_HOST", "")
+    host = _jail_exposure.environ().get("DOCKER_HOST", "")
     if host.startswith(("tcp://", "ssh://", "http://", "https://")):
         parts.append(
             f"DOCKER_HOST points at a Docker daemon over the network ({host.split('://')[0]}): the jail does not "
@@ -566,7 +566,7 @@ def exposure() -> str | None:
             "network connections, so a confined command can drive it and escape the jail through it. Bind the "
             "daemon to a socket this user cannot write, or require TLS client certificates, to close this."
         )
-    abstract = _jail_exposure.dbus_addresses(os.environ.get("DBUS_SESSION_BUS_ADDRESS", ""))[1]
+    abstract = _jail_exposure.dbus_addresses(_jail_exposure.environ().get("DBUS_SESSION_BUS_ADDRESS", ""))[1]
     if abstract:
         parts.append(
             f"the session bus listens on an abstract socket ({', '.join(abstract)}), which has no file for the "

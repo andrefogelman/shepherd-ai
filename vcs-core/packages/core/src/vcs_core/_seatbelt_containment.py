@@ -71,12 +71,12 @@ def _terminal_server_dirs() -> tuple[str, ...]:
 def _terminal_server_candidates() -> list[str]:
     uid = os.getuid()
     candidates = [f"/tmp/tmux-{uid}"]
-    if os.environ.get("TMUX_TMPDIR"):
-        candidates.append(str(Path(os.environ["TMUX_TMPDIR"]) / f"tmux-{uid}"))
-    if os.environ.get("SCREENDIR"):
-        candidates.append(os.environ["SCREENDIR"])
-    if os.environ.get("TMPDIR"):
-        candidates.append(str(Path(os.environ["TMPDIR"]) / ".screen"))
+    if _jail_exposure.environ().get("TMUX_TMPDIR"):
+        candidates.append(str(Path(_jail_exposure.environ()["TMUX_TMPDIR"]) / f"tmux-{uid}"))
+    if _jail_exposure.environ().get("SCREENDIR"):
+        candidates.append(_jail_exposure.environ()["SCREENDIR"])
+    if _jail_exposure.environ().get("TMPDIR"):
+        candidates.append(str(Path(_jail_exposure.environ()["TMPDIR"]) / ".screen"))
     return candidates
 
 
@@ -89,9 +89,9 @@ def _named_sockets() -> tuple[str, ...]:
 
 
 def _named_socket_candidates() -> list[str]:
-    candidates = _jail_exposure.dbus_addresses(os.environ.get("DBUS_SESSION_BUS_ADDRESS", ""))[0]
-    if os.environ.get("TMUX"):
-        candidates.append(os.environ["TMUX"].split(",")[0])
+    candidates = _jail_exposure.dbus_addresses(_jail_exposure.environ().get("DBUS_SESSION_BUS_ADDRESS", ""))[0]
+    if _jail_exposure.environ().get("TMUX"):
+        candidates.append(_jail_exposure.environ()["TMUX"].split(",")[0])
     return candidates
 
 
@@ -194,7 +194,7 @@ class SeatbeltContainmentBackend:
             "not writable, to close this."
             for sock in _docker_sockets()
         ]
-        host = os.environ.get("DOCKER_HOST", "")
+        host = _jail_exposure.environ().get("DOCKER_HOST", "")
         if host.startswith(("tcp://", "ssh://", "http://", "https://")):
             parts.append(
                 f"DOCKER_HOST points at a Docker daemon over the network ({host.split('://')[0]}): a confined "
@@ -208,7 +208,7 @@ class SeatbeltContainmentBackend:
                 "can drive it and escape the sandbox through it. Bind the daemon to a socket this user cannot "
                 "write, or require TLS client certificates, to close this."
             )
-        abstract = _jail_exposure.dbus_addresses(os.environ.get("DBUS_SESSION_BUS_ADDRESS", ""))[1]
+        abstract = _jail_exposure.dbus_addresses(_jail_exposure.environ().get("DBUS_SESSION_BUS_ADDRESS", ""))[1]
         if abstract:
             parts.append(
                 f"the session bus listens on an abstract socket ({', '.join(abstract)}), which has no path for "

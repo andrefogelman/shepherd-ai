@@ -32,6 +32,12 @@ pytestmark = [
 
 
 @pytest.fixture(autouse=True)
+def live_environment(monkeypatch):
+    """Each test reads the environment it sets, not one a resolve_programs call kept earlier."""
+    monkeypatch.setattr(_jail_exposure, "_ENVIRON", None, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def no_ssh_login(monkeypatch):
     """exposure() would log in to the test host's sshd; tests/unit/test_jail_exposure.py covers that."""
     monkeypatch.setattr(_jail_exposure, "_SSH_LOGS_IN", False)
@@ -865,3 +871,20 @@ def test_landlock_uses_the_bwrap_resolved_before_a_path_change(tmp_path, monkeyp
     assert landlock._find_bwrap() == real
     monkeypatch.setattr(_jail_exposure, "_PROGRAMS", {})
     assert landlock._find_bwrap() == str(planted)  # not resolved first: the PATH of the moment
+
+
+def test_landlock_hides_what_the_kept_environment_names_after_it_changes(tmp_path, monkeypatch) -> None:
+    """A caller that resolved first may unset the servers' addresses for the command; the
+    jail still hides the sockets they named."""
+    monkeypatch.setattr(_jail_exposure, "_PROGRAMS", {})  # what it finds stays with this test
+    current = tmp_path / "current"
+    current.mkdir()
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        server.bind(str(current / "default"))
+        monkeypatch.setenv("TMUX", f"{current}/default,1234,0")
+        _jail_exposure.resolve_programs()
+        monkeypatch.delenv("TMUX")
+        assert os.path.realpath(current / "default") in landlock._named_sockets()
+    finally:
+        server.close()

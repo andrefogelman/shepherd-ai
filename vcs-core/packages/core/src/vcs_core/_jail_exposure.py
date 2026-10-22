@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import unquote
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
 #: Where per-user Docker daemons put their socket: Docker Desktop (macOS, then Linux),
 #: Colima (profile `default`, older releases), OrbStack, Rancher Desktop.
@@ -60,20 +60,39 @@ _SSH_LOGS_IN: bool | None = None
 _PROGRAM_NAMES = ("bwrap", "ssh")
 _PROGRAMS: dict[str, str | None] = {}
 
+#: The environment as `resolve_programs` found it; until then the checks read the live one.
+_ENVIRON: dict[str, str] | None = None
+
 
 def resolve_programs() -> dict[str, str | None]:
     """Find bubblewrap and ssh on the current PATH now, and use those paths for the process.
 
-    A caller that is about to put someone else's PATH in this process's environment (a
+    A caller that is about to put someone else's environment in this process's (a
     repository's settings for the jailed command, say) calls this first, so the PATH it
     sets chooses the tools of the jailed command and not the binaries that hide sockets
-    from the jail or check what it leaves in reach. Without this call each use looks the
-    program up when it runs.
+    from the jail or check what it leaves in reach. The environment itself is kept too:
+    which sockets to hide and what to report are read from it (`environ`), so the caller
+    may then unset the command servers' addresses for the jailed command without the jail
+    losing track of them. Without this call each use reads the live values when it runs.
     """
+    global _ENVIRON
+    if _ENVIRON is None:
+        _ENVIRON = dict(os.environ)
     for name in _PROGRAM_NAMES:
         if name not in _PROGRAMS:
-            _PROGRAMS[name] = shutil.which(name)
+            _PROGRAMS[name] = shutil.which(name, path=_ENVIRON.get("PATH"))
     return dict(_PROGRAMS)
+
+
+def environ() -> Mapping[str, str]:
+    """The environment `resolve_programs` kept, else the live one."""
+    return _ENVIRON if _ENVIRON is not None else os.environ
+
+
+def home() -> Path:
+    """The user's home in `environ`, as `Path.home` reads it from the live one."""
+    value = environ().get("HOME")
+    return Path(value) if value else Path.home()
 
 
 def program(name: str) -> str | None:
@@ -104,7 +123,7 @@ def dbus_addresses(value: str) -> tuple[list[str], list[str]]:
 
 
 def _docker_config_dir() -> Path:
-    return Path(os.environ.get("DOCKER_CONFIG") or Path.home() / ".docker")
+    return Path(environ().get("DOCKER_CONFIG") or home() / ".docker")
 
 
 def docker_context_hosts() -> list[str]:
@@ -135,11 +154,10 @@ def docker_socket_candidates() -> list[str]:
     """
     candidates = [
         host[len("unix://") :]
-        for host in (os.environ.get("DOCKER_HOST", ""), *docker_context_hosts())
+        for host in (environ().get("DOCKER_HOST", ""), *docker_context_hosts())
         if host.startswith("unix://")
     ]
-    home = Path.home()
-    candidates += [str(home / relative) for relative in _USER_DOCKER_SOCKETS]
+    candidates += [str(home() / relative) for relative in _USER_DOCKER_SOCKETS]
     return candidates
 
 
@@ -293,7 +311,9 @@ def _ssh_argv(ssh: str, known_hosts: str, user: str, host: str, port: int) -> li
 def _authenticates(argv: Sequence[str]) -> bool:
     """Run ssh until it says it authenticated, exits, or the timeout passes; then stop it."""
     try:
-        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        proc = subprocess.Popen(
+            argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=dict(environ())
+        )
     except OSError:
         return False
     assert proc.stderr is not None
