@@ -626,3 +626,52 @@ def test_providers_import_no_sdk_and_no_legacy_reach() -> None:
     )
     out = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=True)
     assert out.stdout.strip() == "none"
+
+
+def test_headless_runs_the_claude_path_it_was_given(tmp_path, monkeypatch) -> None:
+    """A caller that found claude before its PATH changed passes that path; the PATH of the
+    moment does not choose the CLI."""
+    _clear_claude_auth_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    monkeypatch.setattr(providers_module.shutil, "which", lambda cmd: "/planted/claude" if cmd == "claude" else None)
+    seen = {}
+
+    class _Proc:
+        returncode = 1
+        stderr = "refused for the probe"
+        stdout = ""
+
+    class _Cap:
+        working_path = str(tmp_path)
+
+        def launch_confined(self, command, confinement):
+            seen["command"] = list(command)
+            return _Proc()
+
+    provider = ClaudeHeadlessProvider(prompt="x", claude_path="/usr/local/bin/claude")
+    with pytest.raises(RuntimeError):
+        provider.execute(None, None, None, {}, execution=_Cap(), confinement=object())
+    assert "/usr/local/bin/claude" in seen["command"]
+    assert "/planted/claude" not in seen["command"]
+
+
+def test_probe_claude_auth_runs_the_claude_path_it_was_given(monkeypatch) -> None:
+    _clear_claude_auth_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    monkeypatch.setattr(providers_module.shutil, "which", lambda cmd: "/planted/claude" if cmd == "claude" else None)
+    seen = {}
+
+    class _Proc:
+        returncode = 0
+        stdout = '{"type":"result","subtype":"success","is_error":false,"result":"ok","usage":{}}'
+        stderr = ""
+
+    def _run(argv, *a, **k):
+        seen["argv"] = list(argv)
+        return _Proc()
+
+    monkeypatch.setattr(providers_module.subprocess, "run", _run)
+    ok, _ = providers_module.probe_claude_auth(claude_path="/usr/local/bin/claude")
+    assert ok is True
+    assert "/usr/local/bin/claude" in seen["argv"]
+    assert "/planted/claude" not in seen["argv"]

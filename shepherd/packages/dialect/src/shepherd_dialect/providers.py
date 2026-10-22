@@ -326,7 +326,7 @@ def _claude_preflight_refusal(resolution: _ClaudeAuthResolution) -> tuple[str, s
     return None
 
 
-def probe_claude_auth(*, budget_seconds: int = 30) -> tuple[bool, str]:
+def probe_claude_auth(*, budget_seconds: int = 30, claude_path: str | None = None) -> tuple[bool, str]:
     """Check Claude CLI auth under Shepherd's scrubbed-config conditions; return ``(ok, detail)``.
 
     Runs a minimal ``claude -p`` in the **parent** (not through the jail — no
@@ -338,7 +338,7 @@ def probe_claude_auth(*, budget_seconds: int = 30) -> tuple[bool, str]:
     probe and run, whose Seatbelt-blocked keychain refresh only bites the confined
     body). Reaches the network and may briefly call the model. Never raises.
     """
-    cli = shutil.which("claude")
+    cli = claude_path or shutil.which("claude")
     if cli is None:
         return False, "`claude` not found on PATH"
     resolution = _resolve_claude_auth_diagnostic()
@@ -928,6 +928,8 @@ class ClaudeAgentProvider:
     allowed_tools: tuple[str, ...] = ("Write", "Edit", "Read")
     max_turns: int = 4
     budget_seconds: int = 120
+    # the claude CLI to run, found by a caller before its PATH changed; None looks it up on PATH
+    claude_path: str | None = None
 
     _SCRATCH = ".claude-scratch"
 
@@ -972,7 +974,7 @@ class ClaudeAgentProvider:
             )
         if not self.prompt:
             raise ValueError("ClaudeAgentProvider needs a prompt — the prompt is the body")
-        cli = shutil.which("claude")
+        cli = self.claude_path or shutil.which("claude")
         if cli is None:
             raise RuntimeError("claude CLI not found on PATH — see the package README runbook note")
         scratch = Path(execution.working_path) / self._SCRATCH
@@ -1044,6 +1046,8 @@ class ClaudeHeadlessProvider:
     max_turns: int | None = None
     budget_seconds: int = 240
     model: str | None = None  # passed to `claude --model`; None keeps the account default
+    # the claude CLI to run, found by a caller before its PATH changed; None looks it up on PATH
+    claude_path: str | None = None
 
     _SCRATCH = ".claude-scratch"
 
@@ -1112,7 +1116,7 @@ class ClaudeHeadlessProvider:
                 "ExecutionCapability and a lowered ConfinementSpec."
             )
         prompt = _provider_prompt(self.prompt, task_body, args, "ClaudeHeadlessProvider")
-        cli = shutil.which("claude")
+        cli = self.claude_path or shutil.which("claude")
         if cli is None:
             raise RuntimeError("claude CLI not found on PATH — see the package README runbook note")
         invocation_id = _invocation_id(self.provider_id, execution)
