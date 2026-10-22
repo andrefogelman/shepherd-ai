@@ -25,8 +25,10 @@ from vcs_core._seatbelt_containment import SeatbeltContainmentBackend, lower_to_
 
 @pytest.fixture(autouse=True)
 def no_ssh_login(monkeypatch):
-    """exposure() would log in to the test host's sshd; tests/unit/test_jail_exposure.py covers that."""
+    """exposure() would log in to the test host's sshd and list its ssh agents;
+    tests/unit/test_jail_exposure.py covers both."""
     monkeypatch.setattr(_jail_exposure, "_SSH_LOGS_IN", False)
+    monkeypatch.setattr(_jail_exposure, "agent_sockets", list)
 
 
 _macos = pytest.mark.skipif(
@@ -384,3 +386,23 @@ def test_seatbelt_refuses_a_connect_to_the_ssh_agent(monkeypatch) -> None:
         for server in servers:
             server.close()
         shutil.rmtree(short, ignore_errors=True)
+
+
+def test_seatbelt_reports_the_agents_it_does_not_deny(monkeypatch) -> None:
+    """The agent SSH_AUTH_SOCK names is denied, and so is one under a terminal server's
+    directory; another agent on disk stays reachable, and the report names it and only it."""
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+    monkeypatch.setattr(seatbelt, "_docker_sockets", tuple)
+    monkeypatch.setattr(_jail_exposure, "docker_network_endpoints", list)
+    monkeypatch.setattr(seatbelt, "_skipped", lambda candidates, is_kind: [])
+    monkeypatch.setattr(seatbelt, "_named_sockets", lambda: ("/s/named",))
+    monkeypatch.setattr(seatbelt, "_terminal_server_dirs", lambda: ("/tmp/tmux-9",))
+    other = "/private/tmp/com.apple.launchd.A/Listeners"
+    monkeypatch.setattr(_jail_exposure, "agent_sockets", lambda: ["/s/named", "/tmp/tmux-9/agent", other])
+    message = SeatbeltContainmentBackend().exposure() or ""
+    assert f"stay reachable ({other})" in message
+    assert "/s/named" not in message
+    assert "tmux-9" not in message
+    monkeypatch.setattr(_jail_exposure, "agent_sockets", list)
+    assert SeatbeltContainmentBackend().exposure() is None

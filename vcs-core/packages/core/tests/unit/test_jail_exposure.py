@@ -8,9 +8,12 @@ that prints what the real one prints, so no host's sshd is touched.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import socket
 import stat
 import sys
+import tempfile
 import threading
 from pathlib import Path
 
@@ -275,3 +278,33 @@ def test_resolve_programs_keeps_the_environment_the_checks_read(tmp_path, monkey
     assert not any(c.startswith(str(planted)) for c in candidates)
     monkeypatch.setattr(exposure, "_ENVIRON", None)  # not resolved first: the live values
     assert exposure.docker_context_hosts() == [f"unix://{planted}/docker.sock"]
+
+
+def test_agent_sockets_finds_this_users_agents_where_they_put_them(monkeypatch) -> None:
+    """An agent SSH_AUTH_SOCK does not name is still on disk: OpenSSH's under $TMPDIR,
+    1Password's under the home. A file there that is not a socket, and a link, are not one."""
+    short = Path(tempfile.mkdtemp(prefix="ag", dir="/tmp"))  # sun_path is 104 bytes on macOS
+    servers: list[socket.socket] = []
+    try:
+        home, tmp = short / "h", short / "t"
+        (home / ".1password").mkdir(parents=True)
+        (home / ".gnupg").mkdir()
+        (tmp / "ssh-abc").mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("TMPDIR", str(tmp))
+        monkeypatch.delenv("GNUPGHOME", raising=False)
+        agents = [tmp / "ssh-abc" / "agent.7", home / ".1password" / "agent.sock"]
+        for path in agents:
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(str(path))
+            servers.append(server)
+        (home / ".gnupg" / "S.gpg-agent.ssh").write_text("")
+        (home / ".bitwarden-ssh-agent.sock").symlink_to(agents[0])
+        found = exposure.agent_sockets()
+        for path in agents:
+            assert found.count(os.path.realpath(path)) == 1, found
+        assert not any(f.startswith(os.path.realpath(home / ".gnupg")) for f in found)
+    finally:
+        for server in servers:
+            server.close()
+        shutil.rmtree(short, ignore_errors=True)

@@ -229,6 +229,14 @@ class SeatbeltContainmentBackend:
                 "or a link to one), so the sandbox has no rule for them: a server listening there stays "
                 "reachable. Remove them, or point the variable that names them elsewhere, to close this."
             )
+        named, dirs = _named_sockets(), _terminal_server_dirs()
+        agents = [
+            a
+            for a in _jail_exposure.agent_sockets()
+            if a not in named and not any(Path(a).is_relative_to(d) for d in dirs)
+        ]
+        if agents:
+            parts.append(_jail_exposure.agent_message(agents, "sandbox"))
         if _loopback_ssh():
             parts.append(_jail_exposure.ssh_message("sandbox", "whenever the run allows network access"))
         return " Also: ".join(parts) if parts else None

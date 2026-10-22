@@ -16,6 +16,7 @@ import re
 import selectors
 import shutil
 import socket
+import stat
 import subprocess
 import tempfile
 import time
@@ -371,6 +372,69 @@ def _try_ssh_logins() -> bool:
         known.write("".join(f"{_HOST_KEY_ALIAS} {key}\n" for key in keys))
         known.flush()
         return any(_authenticates(_ssh_argv(ssh, known.name, user, host, port)) for host, port in reachable)
+
+
+def _agent_socket_patterns() -> list[str]:
+    """Where ssh agents put their socket when started without a path of the user's choosing.
+
+    OpenSSH's ssh-agent (under /tmp or $TMPDIR), launchd's on macOS, gpg-agent's ssh
+    socket, 1Password, Bitwarden and Secretive. An agent started with ``-a`` elsewhere is
+    not found here.
+    """
+    env, home_dir, uid = environ(), home(), os.getuid()
+    temps = dict.fromkeys(t.rstrip("/") for t in ("/tmp", env.get("TMPDIR", "")) if t)
+    patterns = [f"{t}/ssh-*/agent.*" for t in temps]
+    patterns.append("/private/tmp/com.apple.launchd.*/Listeners")
+    gnupg = env.get("GNUPGHOME") or str(home_dir / ".gnupg")
+    patterns.append(f"{gnupg}/S.gpg-agent.ssh")
+    for runtime in dict.fromkeys(r for r in (env.get("XDG_RUNTIME_DIR", ""), f"/run/user/{uid}") if r):
+        patterns += [f"{runtime}/gnupg/S.gpg-agent.ssh", f"{runtime}/gnupg/*/S.gpg-agent.ssh"]
+    patterns += [
+        str(home_dir / ".1password" / "agent.sock"),
+        str(home_dir / "Library" / "Group Containers" / "2BUA8C4S2C.com.1password" / "t" / "agent.sock"),
+        str(home_dir / ".bitwarden-ssh-agent.sock"),
+        str(home_dir / "Library" / "Containers" / "com.maxgoedjen.Secretive.SecretAgent" / "Data" / "socket.ssh"),
+    ]
+    return patterns
+
+
+def _matches(pattern: str) -> list[str]:
+    """The paths matching an absolute ``pattern``.
+
+    Only the components from the first one holding `*` on are a pattern: a home or
+    TMPDIR holding `[` is taken as written.
+    """
+    parts = Path(pattern).parts
+    first = next((i for i, part in enumerate(parts) if "*" in part), None)
+    if first is None:
+        return [pattern]
+    return sorted(str(path) for path in Path(*parts[:first]).glob("/".join(parts[first:])))
+
+
+def agent_sockets() -> list[str]:
+    """The ssh agent sockets this user owns at the places `_agent_socket_patterns` names, resolved.
+
+    A link is not followed: another user could plant one, and a socket of this user's
+    reached through it is found at its own place or not at all.
+    """
+    found: list[str] = []
+    for pattern in _agent_socket_patterns():
+        for path in _matches(pattern):
+            with suppress(OSError):
+                st = os.lstat(path)
+                real = os.path.realpath(path)
+                if stat.S_ISSOCK(st.st_mode) and st.st_uid == os.getuid() and real not in found:
+                    found.append(real)
+    return found
+
+
+def agent_message(paths: Sequence[str], jail: str) -> str:
+    """The report for agent sockets left reachable, worded for ``jail`` ("jail", "sandbox")."""
+    return (
+        f"ssh agent sockets that SSH_AUTH_SOCK does not name stay reachable ({', '.join(paths)}): a confined "
+        f"command can connect to one and sign with this user's keys. The {jail} hides only the agent "
+        "SSH_AUTH_SOCK names. Stop the agents this run does not need, to close this."
+    )
 
 
 def ssh_message(jail: str, when: str) -> str:

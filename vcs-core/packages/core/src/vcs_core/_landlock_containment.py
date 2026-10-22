@@ -594,6 +594,13 @@ def exposure() -> str | None:
             "link to one), so the jail does not mask them: a server listening there stays reachable from inside "
             "the jail. Remove them, or point the variable that names them elsewhere, to close this."
         )
+    # the named sockets and those under `dirs` are masked, or already reported above
+    named = _named_sockets()
+    agents = [
+        a for a in _jail_exposure.agent_sockets() if a not in named and not any(Path(a).is_relative_to(d) for d in dirs)
+    ]
+    if agents:
+        parts.append(_jail_exposure.agent_message(agents, "jail"))
     displays = _x_displays()
     if displays:
         parts.append(

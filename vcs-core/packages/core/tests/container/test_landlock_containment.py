@@ -39,8 +39,10 @@ def live_environment(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def no_ssh_login(monkeypatch):
-    """exposure() would log in to the test host's sshd; tests/unit/test_jail_exposure.py covers that."""
+    """exposure() would log in to the test host's sshd and list its ssh agents;
+    tests/unit/test_jail_exposure.py covers both."""
     monkeypatch.setattr(_jail_exposure, "_SSH_LOGS_IN", False)
+    monkeypatch.setattr(_jail_exposure, "agent_sockets", list)
 
 
 def test_landlock_available_and_protocol_conformant() -> None:
@@ -947,3 +949,26 @@ def test_landlock_masks_the_ssh_agent_socket_the_environment_names(tmp_path, mon
         assert done.stdout.strip() == "['agent.42', 'neighbour'] refused"
     finally:
         server.close()
+
+
+def test_landlock_reports_the_agents_it_does_not_hide(monkeypatch, fresh_hiding) -> None:
+    """The agent SSH_AUTH_SOCK names is masked, and one under a hidden directory is hidden;
+    another agent on disk stays reachable, and the report names it and only it."""
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+    monkeypatch.setattr(landlock, "_docker_sockets", lambda hidden: ())
+    monkeypatch.setattr(_jail_exposure, "docker_network_endpoints", list)
+    monkeypatch.setattr(landlock, "_x_displays", lambda: ())
+    monkeypatch.setattr(landlock, "_skipped", lambda candidates, is_kind: [])
+    monkeypatch.setattr(landlock, "_hidden_dirs", lambda: ("/run/user/9",))
+    monkeypatch.setattr(landlock, "_why_not_hidden", lambda dirs: None)
+    monkeypatch.setattr(landlock, "_named_sockets", lambda: ("/s/named",))
+    other = "/tmp/ssh-x/agent.1"
+    agents = ["/s/named", "/run/user/9/gnupg/S.gpg-agent.ssh", other]
+    monkeypatch.setattr(_jail_exposure, "agent_sockets", lambda: agents)
+    message = landlock.exposure() or ""
+    assert f"stay reachable ({other})" in message
+    assert "/s/named" not in message
+    assert "S.gpg-agent.ssh" not in message
+    monkeypatch.setattr(_jail_exposure, "agent_sockets", list)
+    assert landlock.exposure() is None
