@@ -18,7 +18,6 @@ import fcntl
 import json
 import os
 import pwd
-import shutil
 import stat
 import struct
 import subprocess
@@ -329,7 +328,7 @@ def _hidden_dirs() -> tuple[str, ...]:
 
 
 def _find_bwrap() -> str | None:
-    return shutil.which("bwrap")
+    return _jail_exposure.program("bwrap")
 
 
 def _bound_back(dirs: Sequence[str], keep: Sequence[str]) -> list[str]:

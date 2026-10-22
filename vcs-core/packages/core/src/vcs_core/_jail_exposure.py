@@ -56,6 +56,32 @@ _SSH_TIMEOUT_S = 10
 # hiding fails, and each try is a line in the host's auth log.
 _SSH_LOGS_IN: bool | None = None
 
+#: The programs the jail runs by name, and their paths once `resolve_programs` found them.
+_PROGRAM_NAMES = ("bwrap", "ssh")
+_PROGRAMS: dict[str, str | None] = {}
+
+
+def resolve_programs() -> dict[str, str | None]:
+    """Find bubblewrap and ssh on the current PATH now, and use those paths for the process.
+
+    A caller that is about to put someone else's PATH in this process's environment (a
+    repository's settings for the jailed command, say) calls this first, so the PATH it
+    sets chooses the tools of the jailed command and not the binaries that hide sockets
+    from the jail or check what it leaves in reach. Without this call each use looks the
+    program up when it runs.
+    """
+    for name in _PROGRAM_NAMES:
+        if name not in _PROGRAMS:
+            _PROGRAMS[name] = shutil.which(name)
+    return dict(_PROGRAMS)
+
+
+def program(name: str) -> str | None:
+    """The path `resolve_programs` found for ``name``, else a lookup on the current PATH."""
+    if name in _PROGRAMS:
+        return _PROGRAMS[name]
+    return shutil.which(name)
+
 
 def dbus_addresses(value: str) -> tuple[list[str], list[str]]:
     r"""The ``path=`` sockets and the ``abstract=`` names in a D-Bus address list.
@@ -304,7 +330,7 @@ def ssh_logs_in() -> bool:
 
 
 def _try_ssh_logins() -> bool:
-    ssh = shutil.which("ssh")
+    ssh = program("ssh")
     keys = _host_keys()
     try:
         user = pwd.getpwuid(os.getuid()).pw_name

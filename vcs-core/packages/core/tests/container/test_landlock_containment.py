@@ -852,3 +852,16 @@ def test_landlock_reports_docker_host_over_the_network(monkeypatch, fresh_hiding
     assert "over the network (tcp)" in message
     monkeypatch.setenv("DOCKER_HOST", "ssh://user@host")
     assert "over the network (ssh)" in (landlock.exposure() or "")
+
+
+def test_landlock_uses_the_bwrap_resolved_before_a_path_change(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(_jail_exposure, "_PROGRAMS", {})
+    real = shutil.which("bwrap")
+    planted = tmp_path / "bwrap"
+    planted.write_text("#!/bin/sh\nexit 0\n")
+    planted.chmod(0o755)
+    _jail_exposure.resolve_programs()
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+    assert landlock._find_bwrap() == real
+    monkeypatch.setattr(_jail_exposure, "_PROGRAMS", {})
+    assert landlock._find_bwrap() == str(planted)  # not resolved first: the PATH of the moment
