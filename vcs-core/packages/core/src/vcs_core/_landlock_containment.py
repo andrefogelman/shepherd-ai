@@ -545,7 +545,8 @@ def exposure() -> str | None:
     """
     parts: list[str] = []
     dirs = _hidden_dirs()
-    reason = _why_not_hidden(dirs) if dirs else None
+    # with no directory to hide, bubblewrap still masks the named sockets
+    reason = _why_not_hidden(dirs) if dirs or _named_sockets() else None
     if reason is not None:
         parts.append(
             f"the jail does not hide {', '.join((*dirs, *_loose_sockets(dirs)))}, which are or hold sockets of servers that run commands for "
@@ -621,7 +622,7 @@ def service_manager_exposure() -> str | None:
 def _hiding_argv(keep: Sequence[str] = ()) -> list[str]:
     """The bubblewrap prefix for this launch, or [] when nothing needs or can be hidden."""
     dirs = _hidden_dirs()
-    if not dirs:
+    if not dirs and not _named_sockets():
         return []
     bwrap = _find_bwrap()
     if bwrap is None or _why_not_hidden(dirs) is not None:
@@ -734,7 +735,7 @@ class LandlockContainmentBackend:
         # hiding as failed for these directories: the launches that follow run without
         # bubblewrap and with the warning, like a host where it cannot start.
         hidden = _hidden_dirs()
-        if hidden and _why_not_hidden(hidden) is None:
+        if (hidden or _named_sockets()) and _why_not_hidden(hidden) is None:
             kept = (str(wd), *json.loads(profile or "[]"))
             # the kept paths are walked inside the jail by the first probe for them in this
             # process; later probes check the masked sockets only

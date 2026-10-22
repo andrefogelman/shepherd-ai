@@ -972,3 +972,41 @@ def test_landlock_reports_the_agents_it_does_not_hide(monkeypatch, fresh_hiding)
     assert "S.gpg-agent.ssh" not in message
     monkeypatch.setattr(_jail_exposure, "agent_sockets", list)
     assert landlock.exposure() is None
+
+
+def test_landlock_masks_the_named_sockets_with_no_directory_to_hide(tmp_path, monkeypatch, fresh_hiding) -> None:
+    """With no runtime directory and no tmux directory of this user's to hide, bubblewrap
+    still runs and puts /dev/null over the sockets the environment names."""
+    _needs_bwrap()
+    agent = tmp_path / "agent.1"
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(agent))
+    monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.setattr(landlock, "_hidden_dirs", tuple)
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        server.bind(str(agent))
+        server.listen(1)
+        assert landlock._hiding_argv()[-1] == "--"
+        work = tmp_path / "work"
+        work.mkdir()
+        backend = LandlockContainmentBackend()
+        profile = backend.profile_for((str(work),), allow_network=True)
+        backend.probe(profile, work, writable_roots=(str(work),))
+        done = backend.launch(
+            profile,
+            work,
+            [
+                sys.executable,
+                "-c",
+                "import socket, sys\n"
+                "c = socket.socket(socket.AF_UNIX)\n"
+                "try:\n    c.connect(sys.argv[1]); print('connected')\n"
+                "except OSError:\n    print('refused')",
+                str(agent),
+            ],
+        )
+        assert done.returncode == 0, done.stderr
+        assert done.stdout.strip() == "refused"
+    finally:
+        server.close()
