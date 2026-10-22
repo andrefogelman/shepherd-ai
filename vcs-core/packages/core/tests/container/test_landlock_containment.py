@@ -625,8 +625,8 @@ def test_landlock_probe_walks_kept_paths_once_per_process(tmp_path, monkeypatch,
     real_launch = backend.launch
 
     def recording(profile, root, command, **kwargs):
-        if command[1:2] == ["-c"] and command[2] == landlock._HIDDEN_DIRS_CHECK:
-            seen.append(json.loads(command[3])["kept"])
+        if command[1:3] == ["-I", "-c"] and command[3] == landlock._HIDDEN_DIRS_CHECK:
+            seen.append(json.loads(command[4])["kept"])
         return real_launch(profile, root, command, **kwargs)
 
     monkeypatch.setattr(backend, "launch", recording)
@@ -888,3 +888,20 @@ def test_landlock_hides_what_the_kept_environment_names_after_it_changes(tmp_pat
         assert os.path.realpath(current / "default") in landlock._named_sockets()
     finally:
         server.close()
+
+
+def test_landlock_runner_ignores_python_settings_and_the_working_directory(tmp_path, monkeypatch) -> None:
+    """The runner starts on the host, before Landlock: neither a package planted where it
+    runs nor a PYTHON* variable may change what it imports."""
+    backend = LandlockContainmentBackend()
+    marker = tmp_path.parent / f"{tmp_path.name}-imported"
+    marker.unlink(missing_ok=True)
+    planted = tmp_path / "vcs_core"
+    planted.mkdir()
+    (planted / "__init__.py").write_text(f"open({str(marker)!r}, 'w').close()\n")
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
+    profile = backend.profile_for((str(tmp_path),), allow_network=True)
+    inside = tmp_path / "ok.txt"
+    assert backend.launch(profile, tmp_path, ["/usr/bin/touch", "--", str(inside)]).returncode == 0
+    assert inside.exists()
+    assert not marker.exists()

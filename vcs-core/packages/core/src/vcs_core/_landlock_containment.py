@@ -470,7 +470,14 @@ def _why_not_hidden(dirs: tuple[str, ...]) -> str | None:
         else:
             try:
                 trial = subprocess.run(
-                    [*_bwrap_argv(bwrap, dirs), sys.executable, "-c", _HIDDEN_DIRS_CHECK, _hidden_dirs_spec(dirs)],
+                    [
+                        *_bwrap_argv(bwrap, dirs),
+                        sys.executable,
+                        "-I",
+                        "-c",
+                        _HIDDEN_DIRS_CHECK,
+                        _hidden_dirs_spec(dirs),
+                    ],
                     capture_output=True,
                     text=True,
                     check=False,
@@ -661,6 +668,9 @@ class LandlockContainmentBackend:
                 *(_OUTER_PREFIX if outer else ()),
                 *_hiding_argv((cwd, *json.loads(profile or "[]"))),
                 sys.executable,
+                # -I: no PYTHON* variable, user site or working directory decides what the
+                # runner imports; it runs on the host before Landlock confines anything
+                "-I",
                 "-m",
                 "vcs_core._landlock_containment",
                 _RUNNER_SENTINEL,
@@ -721,7 +731,7 @@ class LandlockContainmentBackend:
             done = self.launch(
                 profile,
                 working_root,
-                [sys.executable, "-c", _HIDDEN_DIRS_CHECK, _hidden_dirs_spec(hidden, kept, walk_kept=walk)],
+                [sys.executable, "-I", "-c", _HIDDEN_DIRS_CHECK, _hidden_dirs_spec(hidden, kept, walk_kept=walk)],
                 outer=False,
             )
             if done.returncode == _CONFINE_FAILED_RC:
