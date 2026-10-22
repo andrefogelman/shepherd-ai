@@ -352,3 +352,35 @@ def test_seatbelt_reports_a_docker_context_and_an_ssh_login(tmp_path, monkeypatc
     meta.joinpath("meta.json").unlink()
     monkeypatch.setattr(seatbelt, "_loopback_ssh", lambda: True)
     assert "inside the sandbox runs cmd outside it" in (backend.exposure() or "")
+
+
+@_macos
+def test_seatbelt_refuses_a_connect_to_the_ssh_agent(monkeypatch) -> None:
+    """Unsetting SSH_AUTH_SOCK leaves launchd's agent socket reachable under `(allow default)`:
+    the profile denies the socket the kept environment names, and only that socket."""
+    short = Path(tempfile.mkdtemp(prefix="sb", dir="/tmp"))  # sun_path is 104 bytes on macOS
+    servers: list[socket.socket] = []
+    try:
+        targets = [str(short / "Listeners"), str(short / "neighbour")]
+        monkeypatch.setenv("SSH_AUTH_SOCK", targets[0])
+        for path in targets:
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(path)
+            server.listen(1)
+            servers.append(server)
+        backend = SeatbeltContainmentBackend()
+        profile = backend.profile_for((str(short),), allow_network=True)
+        probe = (
+            "import socket, sys\n"
+            "for p in sys.argv[1:]:\n"
+            "    c = socket.socket(socket.AF_UNIX)\n"
+            "    try:\n        c.connect(p); print('connected')\n"
+            "    except OSError:\n        print('refused')\n"
+        )
+        done = backend.launch(profile, short, [sys.executable, "-c", probe, *targets])
+        assert done.returncode == 0, done.stderr
+        assert done.stdout.split() == ["refused", "connected"]
+    finally:
+        for server in servers:
+            server.close()
+        shutil.rmtree(short, ignore_errors=True)

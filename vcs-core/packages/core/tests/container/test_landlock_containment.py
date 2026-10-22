@@ -723,6 +723,7 @@ def test_landlock_decodes_a_percent_escaped_bus_path(tmp_path, monkeypatch) -> N
     escaped = str(bus).replace(" ", "%20").replace("~", "%7e")
     monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", f"unix:path={escaped}")
     monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
     assert landlock._named_socket_candidates() == [str(bus)]
 
 
@@ -905,3 +906,44 @@ def test_landlock_runner_ignores_python_settings_and_the_working_directory(tmp_p
     assert backend.launch(profile, tmp_path, ["/usr/bin/touch", "--", str(inside)]).returncode == 0
     assert inside.exists()
     assert not marker.exists()
+
+
+def test_landlock_masks_the_ssh_agent_socket_the_environment_names(tmp_path, monkeypatch, fresh_hiding) -> None:
+    """Unsetting SSH_AUTH_SOCK for the command leaves the socket on disk, and Landlock below
+    ABI 6 does not govern connect: the jail masks the agent the kept environment names, or a
+    command could sign with the user's keys. Its directory stays visible (it may be /tmp)."""
+    _needs_bwrap()
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    (shared / "neighbour").write_text("x")
+    agent = shared / "agent.42"
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(agent))
+    monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+    monkeypatch.delenv("TMUX", raising=False)
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        server.bind(str(agent))
+        server.listen(1)
+        assert landlock._named_sockets() == (os.path.realpath(agent),)
+        work = tmp_path / "work"
+        work.mkdir()
+        backend = LandlockContainmentBackend()
+        profile = backend.profile_for((str(work),), allow_network=True)
+        done = backend.launch(
+            profile,
+            work,
+            [
+                sys.executable,
+                "-c",
+                "import os, socket, sys; p = sys.argv[1]\n"
+                "c = socket.socket(socket.AF_UNIX)\n"
+                "try:\n    c.connect(p); r = 'connected'\n"
+                "except OSError:\n    r = 'refused'\n"
+                "print(sorted(os.listdir(os.path.dirname(p))), r)",
+                str(agent),
+            ],
+        )
+        assert done.returncode == 0, done.stderr
+        assert done.stdout.strip() == "['agent.42', 'neighbour'] refused"
+    finally:
+        server.close()

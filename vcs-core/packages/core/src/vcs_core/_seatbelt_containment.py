@@ -81,7 +81,7 @@ def _terminal_server_candidates() -> list[str]:
 
 
 def _named_sockets() -> tuple[str, ...]:
-    """The session bus and the tmux server the environment names.
+    """The session bus, the tmux server and the ssh agent the environment names.
 
     Denied one by one, not by directory: that directory can be a shared one such as /tmp.
     """
@@ -92,6 +92,10 @@ def _named_socket_candidates() -> list[str]:
     candidates = _jail_exposure.dbus_addresses(_jail_exposure.environ().get("DBUS_SESSION_BUS_ADDRESS", ""))[0]
     if _jail_exposure.environ().get("TMUX"):
         candidates.append(_jail_exposure.environ()["TMUX"].split(",")[0])
+    # The caller may unset SSH_AUTH_SOCK for the command; the socket stays on disk and
+    # would let it sign with the user's keys.
+    if _jail_exposure.environ().get("SSH_AUTH_SOCK"):
+        candidates.append(_jail_exposure.environ()["SSH_AUTH_SOCK"])
     return candidates
 
 
