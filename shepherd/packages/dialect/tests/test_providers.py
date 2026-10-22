@@ -9,10 +9,12 @@ reach). Nothing here touches the network, the key, or the CLI.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 
 import pytest
+from vcs_core import _jail_exposure
 from vcs_core.spi import ExecutionAuthorityRequired
 
 from shepherd_dialect import ClaudeAgentProvider, DeterministicFakeProvider
@@ -558,7 +560,8 @@ def test_read_host_login_records_source_trail_without_secrets(tmp_path, monkeypa
     (home / ".claude").mkdir(parents=True)
     (home / ".claude" / ".credentials.json").write_bytes(b'{"claudeAiOauth":{"expiresAt":1}}')
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg))  # dir exists, credential file does not
-    monkeypatch.setattr(providers_module.Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(_jail_exposure, "_ENVIRON", None)  # nothing kept: the live values
 
     lookup = providers_module._read_host_claude_login()
     assert lookup.blob == b'{"claudeAiOauth":{"expiresAt":1}}'
@@ -675,3 +678,49 @@ def test_probe_claude_auth_runs_the_claude_path_it_was_given(monkeypatch) -> Non
     assert ok is True
     assert "/usr/local/bin/claude" in seen["argv"]
     assert "/planted/claude" not in seen["argv"]
+
+
+@pytest.fixture
+def kept_environment(monkeypatch):
+    """A clean `_jail_exposure` state, as a fresh process has before `resolve_programs`."""
+    monkeypatch.setattr(_jail_exposure, "_PROGRAMS", {})
+    monkeypatch.setattr(_jail_exposure, "_ENVIRON", None)
+    return _jail_exposure
+
+
+def test_host_login_lookup_runs_the_security_found_before_the_path_changed(
+    tmp_path, monkeypatch, kept_environment
+) -> None:
+    """The keychain lookup runs on the host, unjailed: a `security` that a repository's PATH
+    puts first after `resolve_programs` must not be the one it runs."""
+    home = tmp_path / "home"
+    home.mkdir()
+    planted = tmp_path / "repo-tools"
+    planted.mkdir()
+    marker = tmp_path / "planted-ran"
+    script = planted / "security"
+    script.write_text(f"#!/bin/sh\ntouch {marker}\nexit 44\n")
+    script.chmod(0o755)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    kept_environment.resolve_programs()
+    monkeypatch.setenv("PATH", f"{planted}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setattr(sys, "platform", "darwin")
+    providers_module._read_host_claude_login()
+    assert not marker.exists()
+
+
+def test_host_login_lookup_reads_the_config_dir_and_home_it_kept(tmp_path, monkeypatch, kept_environment) -> None:
+    """A repository's CLAUDE_CONFIG_DIR or HOME set after `resolve_programs` does not choose
+    which credentials the host reads."""
+    user = tmp_path / "user-config"
+    user.mkdir()
+    (user / ".credentials.json").write_bytes(b'{"user": true}')
+    repo = tmp_path / "repo-config"
+    repo.mkdir()
+    (repo / ".credentials.json").write_bytes(b'{"repo": true}')
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(user))
+    kept_environment.resolve_programs()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(repo))
+    monkeypatch.setenv("HOME", str(repo))
+    assert providers_module._read_host_claude_login().blob == b'{"user": true}'

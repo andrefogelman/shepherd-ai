@@ -57,7 +57,7 @@ _SSH_TIMEOUT_S = 10
 _SSH_LOGS_IN: bool | None = None
 
 #: The programs the jail runs by name, and their paths once `resolve_programs` found them.
-_PROGRAM_NAMES = ("bwrap", "ssh")
+_PROGRAM_NAMES = ("bwrap", "ssh", "security")
 _PROGRAMS: dict[str, str | None] = {}
 
 #: The environment as `resolve_programs` found it; until then the checks read the live one.
@@ -65,7 +65,7 @@ _ENVIRON: dict[str, str] | None = None
 
 
 def resolve_programs() -> dict[str, str | None]:
-    """Find bubblewrap and ssh on the current PATH now, and use those paths for the process.
+    """Find bubblewrap, ssh and security on the current PATH now, and use those paths for the process.
 
     A caller that is about to put someone else's environment in this process's (a
     repository's settings for the jailed command, say) calls this first, so the PATH it

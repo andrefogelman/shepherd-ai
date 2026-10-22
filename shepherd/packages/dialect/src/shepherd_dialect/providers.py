@@ -22,6 +22,7 @@ from itertools import count
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from vcs_core import _jail_exposure
 from vcs_core.spi import ExecutionAuthorityRequired
 
 from shepherd_dialect.provider_capabilities import (
@@ -163,11 +164,14 @@ def _read_host_claude_login() -> _HostLoginLookup:
     rather than guessing ``security`` exit-code trivia.
     """
     attempts: list[tuple[str, str]] = []
-    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    # The lookup runs on the host, unjailed: the environment and the `security` are the
+    # ones `resolve_programs` kept, not what a repository's settings put in their place.
+    kept = _jail_exposure.environ()
+    config_dir = kept.get("CLAUDE_CONFIG_DIR")
     file_sources: list[tuple[str, Path]] = []
     if config_dir:
         file_sources.append(("configured_config", Path(config_dir) / ".credentials.json"))
-    file_sources.append(("default_config", Path.home() / ".claude" / ".credentials.json"))
+    file_sources.append(("default_config", _jail_exposure.home() / ".claude" / ".credentials.json"))
     for source, candidate in file_sources:
         try:
             if candidate.is_file():
@@ -181,12 +185,17 @@ def _read_host_claude_login() -> _HostLoginLookup:
     if sys.platform != "darwin":
         attempts.append(("macos_keychain", "unsupported_platform"))
         return _HostLoginLookup(None, tuple(attempts))
+    security = _jail_exposure.program("security")
+    if security is None:
+        attempts.append(("macos_keychain", "keychain_failed"))
+        return _HostLoginLookup(None, tuple(attempts))
     try:
         proc = subprocess.run(
-            ["security", "find-generic-password", "-s", _CLAUDE_KEYCHAIN_SERVICE, "-w"],
+            [security, "find-generic-password", "-s", _CLAUDE_KEYCHAIN_SERVICE, "-w"],
             capture_output=True,
             timeout=10,
             check=False,
+            env=dict(kept),
         )
     except subprocess.TimeoutExpired:
         attempts.append(("macos_keychain", "keychain_timeout"))

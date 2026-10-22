@@ -231,7 +231,7 @@ def test_programs_resolved_first_ignore_a_path_set_later(tmp_path, monkeypatch) 
     planted = tmp_path / "planted"
     for directory in (real, planted):
         directory.mkdir()
-        for name in ("bwrap", "ssh"):
+        for name in ("bwrap", "ssh", "security"):
             tool = directory / name
             tool.write_text("#!/bin/sh\n")
             tool.chmod(0o755)
@@ -240,10 +240,15 @@ def test_programs_resolved_first_ignore_a_path_set_later(tmp_path, monkeypatch) 
     monkeypatch.setenv("PATH", str(planted))
     assert exposure.program("ssh") == str(planted / "ssh")
     monkeypatch.setenv("PATH", str(real))
-    assert exposure.resolve_programs() == {"bwrap": str(real / "bwrap"), "ssh": str(real / "ssh")}
+    assert exposure.resolve_programs() == {
+        "bwrap": str(real / "bwrap"),
+        "ssh": str(real / "ssh"),
+        "security": str(real / "security"),
+    }
     monkeypatch.setenv("PATH", str(planted))  # a repository's PATH, set after
     assert exposure.program("bwrap") == str(real / "bwrap")
     assert exposure.program("ssh") == str(real / "ssh")
+    assert exposure.program("security") == str(real / "security")
     assert exposure.resolve_programs()["bwrap"] == str(real / "bwrap")  # kept, not looked up again
 
 
