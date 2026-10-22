@@ -14,19 +14,22 @@ vcs-core-test container, ABI 7). Internal runtime surface — not part of the fr
 from __future__ import annotations
 
 import ctypes
+import fcntl
 import json
 import os
 import pwd
 import shutil
-import socket
 import stat
+import struct
 import subprocess
 import sys
+import termios
 import warnings
 from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from vcs_core import _jail_exposure
 from vcs_core._containment import JailNotEstablished
 
 if TYPE_CHECKING:
@@ -86,9 +89,6 @@ _X11_DIR = "/tmp/.X11-unix"
 #: The (hidden directories, kept paths) whose kept paths the probe has walked inside the
 #: jail in this process; later probes check only the masked sockets.
 _KEPT_WALKED: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
-# The loopback ssh login is tried once per process: exposure() runs again on launches
-# where hiding fails, and each try is a login in the host's auth log.
-_SSH_LOGS_IN: bool | None = None
 
 
 class JailExposureWarning(RuntimeWarning):
@@ -110,9 +110,13 @@ class _RulesetAttr(ctypes.Structure):
     _fields_ = [("handled_access_fs", ctypes.c_uint64)]  # ABI v1: single field
 
 
-class _PathBeneathAttr(ctypes.Structure):
-    _pack_ = 1  # packed: u64 + s32 = 12 bytes (a classic Landlock gotcha)
-    _fields_ = [("allowed_access", ctypes.c_uint64), ("parent_fd", ctypes.c_int32)]
+def _path_beneath(allowed_access: int, parent_fd: int) -> ctypes.Array[ctypes.c_char]:
+    """The landlock_path_beneath_attr struct: packed u64 + s32 = 12 bytes (a classic Landlock gotcha).
+
+    Packed by `struct` rather than a ctypes Structure with `_pack_`: Python 3.14 deprecates
+    `_pack_` without `_layout_`, and 3.19 makes it an error.
+    """
+    return ctypes.create_string_buffer(struct.pack("=Qi", allowed_access, parent_fd), 12)
 
 
 def _syscall(*args: Any) -> int:
@@ -142,13 +146,13 @@ def landlock_confine(writable_dirs: Sequence[str]) -> None:
     for writable_dir in writable_dirs:
         dirfd = os.open(writable_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
-            rule = _PathBeneathAttr(allowed_access=_WRITE_ACCESS, parent_fd=dirfd)
+            rule = _path_beneath(_WRITE_ACCESS, dirfd)
             if (
                 _syscall(
                     _NR_ADD_RULE,
                     ctypes.c_int(fd),
                     ctypes.c_int(_LL_RULE_PATH_BENEATH),
-                    ctypes.byref(rule),
+                    rule,
                     ctypes.c_uint(0),
                 )
                 < 0
@@ -176,12 +180,12 @@ def _allow_dev_null(ruleset_fd: int) -> None:
     except OSError:
         return
     try:
-        rule = _PathBeneathAttr(allowed_access=_WRITE_FILE, parent_fd=nullfd)
+        rule = _path_beneath(_WRITE_FILE, nullfd)
         _syscall(
             _NR_ADD_RULE,
             ctypes.c_int(ruleset_fd),
             ctypes.c_int(_LL_RULE_PATH_BENEATH),
-            ctypes.byref(rule),
+            rule,
             ctypes.c_uint(0),
         )
     finally:
@@ -268,10 +272,7 @@ def _named_sockets() -> tuple[str, ...]:
 
 
 def _named_socket_candidates() -> list[str]:
-    candidates: list[str] = []
-    for address in os.environ.get("DBUS_SESSION_BUS_ADDRESS", "").split(";"):
-        if address.startswith("unix:"):
-            candidates += [f[len("path=") :] for f in address[len("unix:") :].split(",") if f.startswith("path=")]
+    candidates = _jail_exposure.dbus_addresses(os.environ.get("DBUS_SESSION_BUS_ADDRESS", ""))[0]
     if os.environ.get("TMUX"):
         candidates.append(os.environ["TMUX"].split(",")[0])
     return candidates
@@ -402,28 +403,35 @@ def _bwrap_argv(bwrap: str, dirs: Sequence[str], keep: Sequence[str] = ()) -> li
     return [*argv, "--die-with-parent", "--"]
 
 
-#: Exits 1, printing what it found, when a hidden directory holds anything besides the
-#: entries leading to a path bound back into it, directly or through the launching
-#: process's /proc/<pid>/root, or a masked socket or any file under a walked kept path is
+#: Exits 1, printing what it found, when the command is in the launching process's pid
+#: namespace (a process outside would show the hidden directories through
+#: /proc/<pid>/root), a hidden directory holds anything besides the entries leading to a
+#: path bound back into it, or a masked socket or any file under a walked kept path is
 #: still a socket. argv[1] is JSON: {"dirs": [[directory, [allowed entry, ...]], ...],
-#: "masked": [socket, ...], "kept": [path to walk, ...], "host": pid}.
+#: "masked": [socket, ...], "kept": [path to walk, ...], "pidns": the launcher's
+#: /proc/self/ns/pid link, or null where it cannot be read}.
 _HIDDEN_DIRS_CHECK = (
     "import json, os, stat, sys\n"
     "spec = json.loads(sys.argv[1])\n"
     "def sock(p):\n"
     "    try: return stat.S_ISSOCK(os.lstat(p).st_mode)\n"
     "    except OSError: return False\n"
+    "if spec['pidns'] and os.readlink('/proc/self/ns/pid') == spec['pidns']:\n"
+    "    print('the jail shares the launching process pid namespace'); sys.exit(1)\n"
     "for d, a in spec['dirs']:\n"
-    "    for v in (d, '/proc/%d/root%s' % (spec['host'], d)):\n"
-    "        try: extra = sorted(set(os.listdir(v)) - set(a))\n"
-    "        except OSError:\n"
-    "            if v == d: raise\n"
-    "            continue\n"
-    "        if extra: print(v, 'still shows', extra); sys.exit(1)\n"
+    "    extra = sorted(set(os.listdir(d)) - set(a))\n"
+    "    if extra: print(d, 'still shows', extra); sys.exit(1)\n"
     "walked = [os.path.join(r, n) for t in spec['kept'] for r, _, f in os.walk(t) for n in f]\n"
     "for p in spec['masked'] + walked:\n"
     "    if sock(p): print(p, 'is still a socket'); sys.exit(1)\n"
 )
+
+
+def _own_pid_namespace() -> str | None:
+    try:
+        return str(Path("/proc/self/ns/pid").readlink())
+    except OSError:
+        return None
 
 
 def _hidden_dirs_spec(dirs: Sequence[str], keep: Sequence[str] = (), *, walk_kept: bool = False) -> str:
@@ -449,7 +457,7 @@ def _hidden_dirs_spec(dirs: Sequence[str], keep: Sequence[str] = (), *, walk_kep
             "dirs": spec,
             "masked": _masked_sockets(dirs, keep),
             "kept": _bound_back(dirs, keep) if walk_kept else [],
-            "host": os.getpid(),
+            "pidns": _own_pid_namespace(),
         }
     )
 
@@ -481,11 +489,17 @@ def _why_not_hidden(dirs: tuple[str, ...]) -> str | None:
 
 
 def _docker_sockets(hidden: Sequence[str]) -> tuple[str, ...]:
-    """Docker and Podman daemon sockets this user can write to and the jail does not hide."""
-    candidates = ["/var/run/docker.sock", "/run/docker.sock", "/run/podman/podman.sock"]
-    host = os.environ.get("DOCKER_HOST", "")
-    if host.startswith("unix://"):
-        candidates.insert(0, host[len("unix://") :])
+    """Docker and Podman daemon sockets this user can write to and the jail does not hide.
+
+    The system-wide ones, DOCKER_HOST, every Docker context's socket (Docker Desktop for
+    Linux sets no DOCKER_HOST) and where per-user daemons such as Colima put theirs.
+    """
+    candidates = [
+        *_jail_exposure.docker_socket_candidates(),
+        "/var/run/docker.sock",
+        "/run/docker.sock",
+        "/run/podman/podman.sock",
+    ]
     found: list[str] = []
     for candidate in candidates:
         real = os.path.realpath(candidate)
@@ -509,34 +523,8 @@ def _x_displays() -> tuple[str, ...]:
 
 
 def _loopback_ssh() -> bool:
-    """True when this user logs in to sshd on loopback without a prompt.
-
-    Measured by logging in and running `true`: which keys sshd accepts can depend on
-    configuration only root reads (AuthorizedKeysFile, Match, AllowUsers).
-    """
-    global _SSH_LOGS_IN
-    if _SSH_LOGS_IN is None:
-        _SSH_LOGS_IN = any(_ssh_logs_in(host) for host in ("127.0.0.1", "::1"))
-    return _SSH_LOGS_IN
-
-
-def _ssh_logs_in(host: str) -> bool:
-    ssh = shutil.which("ssh")
-    if ssh is None:
-        return False
-    try:
-        socket.create_connection((host, 22), timeout=0.2).close()
-    except OSError:
-        return False
-    argv = [ssh, "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", "-o", "LogLevel=ERROR"]
-    # nothing written to the user's known_hosts by this check
-    argv += ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"]
-    argv += ["-o", "GlobalKnownHostsFile=/dev/null", "-l", pwd.getpwuid(os.getuid()).pw_name, host, "true"]
-    try:
-        done = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, timeout=10, check=False)
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return done.returncode == 0
+    """True when this user logs in to this host's sshd without a prompt (`_jail_exposure`)."""
+    return _jail_exposure.ssh_logs_in()
 
 
 def exposure() -> str | None:
@@ -572,6 +560,20 @@ def exposure() -> str | None:
             "govern network connections, so a confined command that reaches that daemon can escape the jail "
             "through it. Unset DOCKER_HOST, or put the daemon where this user cannot reach it, to close this."
         )
+    endpoints = _jail_exposure.docker_network_endpoints()
+    if endpoints:
+        parts.append(
+            f"a Docker daemon answers on this host over TCP ({', '.join(endpoints)}): the jail does not govern "
+            "network connections, so a confined command can drive it and escape the jail through it. Bind the "
+            "daemon to a socket this user cannot write, or require TLS client certificates, to close this."
+        )
+    abstract = _jail_exposure.dbus_addresses(os.environ.get("DBUS_SESSION_BUS_ADDRESS", ""))[1]
+    if abstract:
+        parts.append(
+            f"the session bus listens on an abstract socket ({', '.join(abstract)}), which has no file for the "
+            "jail to hide: a confined command can connect to it and have the bus start processes outside the "
+            "jail. Run the bus on a path socket (unix:path=, the default with systemd) to close this."
+        )
     skipped = [
         *_skipped([*_runtime_dir_candidates(), *_terminal_server_candidates()], stat.S_ISDIR),
         *_skipped(_named_socket_candidates(), stat.S_ISSOCK),
@@ -590,11 +592,7 @@ def exposure() -> str | None:
             "it; run where no X session of this user is reachable to close this."
         )
     if _loopback_ssh():
-        parts.append(
-            "this user logged in to sshd on this host's loopback without a prompt: `ssh "
-            "localhost cmd` from inside the jail runs cmd outside it. The jail does not govern network "
-            "connections; run where sshd does not accept this user's key to close this."
-        )
+        parts.append(_jail_exposure.ssh_message("jail", "(the jail does not govern network connections)"))
     return " Also: ".join(parts) if parts else None
 
 
@@ -758,6 +756,29 @@ class LandlockContainmentBackend:
             )
 
 
+def _drop_controlling_terminal() -> None:
+    """Detach from the launching terminal, if there is one.
+
+    Landlock does not govern ioctl, and where the kernel allows TIOCSTI (before 6.2, or
+    with dev.tty.legacy_tiocsti=1) a command holding its controlling terminal can push
+    keystrokes into the shell that started the run, which then runs them outside the jail.
+    TIOCNOTTY leaves the process group as it is, so a caller that kills the launch by group
+    still reaches it; a session leader is left alone, since detaching one hangs up its
+    foreground group.
+    """
+    if os.getsid(0) == os.getpid():
+        return
+    try:
+        tty = os.open("/dev/tty", os.O_RDONLY | os.O_NOCTTY)
+    except OSError:
+        return  # no controlling terminal
+    try:
+        with suppress(OSError):
+            fcntl.ioctl(tty, termios.TIOCNOTTY)
+    finally:
+        os.close(tty)
+
+
 def _run_confined() -> int:
     """Runner entry: argv = [SENTINEL, roots_json, *command]. Confine self, then exec command.
 
@@ -770,6 +791,7 @@ def _run_confined() -> int:
         landlock_confine(writable_roots)
     except OSError:
         return _CONFINE_FAILED_RC  # fail-closed: never run the body if confinement failed
+    _drop_controlling_terminal()
     if not command:
         return 0
     os.execvp(command[0], command)  # noqa: S606  intentional shell-free exec (the confined runner)

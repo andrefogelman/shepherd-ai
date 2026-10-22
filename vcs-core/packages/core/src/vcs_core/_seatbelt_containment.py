@@ -18,6 +18,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from vcs_core import _jail_exposure
 from vcs_core._containment import JailNotEstablished
 
 if TYPE_CHECKING:
@@ -88,33 +89,30 @@ def _named_sockets() -> tuple[str, ...]:
 
 
 def _named_socket_candidates() -> list[str]:
-    candidates: list[str] = []
-    for address in os.environ.get("DBUS_SESSION_BUS_ADDRESS", "").split(";"):
-        if address.startswith("unix:"):
-            candidates += [f[len("path=") :] for f in address[len("unix:") :].split(",") if f.startswith("path=")]
+    candidates = _jail_exposure.dbus_addresses(os.environ.get("DBUS_SESSION_BUS_ADDRESS", ""))[0]
     if os.environ.get("TMUX"):
         candidates.append(os.environ["TMUX"].split(",")[0])
     return candidates
 
 
 def _docker_sockets() -> tuple[str, ...]:
-    """Docker daemon sockets this user can write to (Docker Desktop, Colima, OrbStack)."""
-    home = Path.home()
-    candidates = [
-        "/var/run/docker.sock",
-        str(home / ".docker/run/docker.sock"),
-        str(home / ".colima/default/docker.sock"),
-        str(home / ".orbstack/run/docker.sock"),
-    ]
-    host = os.environ.get("DOCKER_HOST", "")
-    if host.startswith("unix://"):
-        candidates.append(host[len("unix://") :])
+    """Docker daemon sockets this user can write to.
+
+    The system one, DOCKER_HOST, every Docker context's socket, and the per-user daemons'
+    (Docker Desktop, Colima, OrbStack).
+    """
+    candidates = ["/var/run/docker.sock", *_jail_exposure.docker_socket_candidates()]
     found: list[str] = []
     for candidate in candidates:
         real = os.path.realpath(candidate)
         if real not in found and Path(real).exists() and os.access(real, os.W_OK):
             found.append(real)
     return tuple(found)
+
+
+def _loopback_ssh() -> bool:
+    """True when this user logs in to this host's sshd without a prompt (`_jail_exposure`)."""
+    return _jail_exposure.ssh_logs_in()
 
 
 def _sbpl_string(value: str) -> str:
@@ -203,6 +201,20 @@ class SeatbeltContainmentBackend:
                 "command that reaches that daemon can escape the sandbox through it. Unset DOCKER_HOST, or put "
                 "the daemon where this user cannot reach it, to close this."
             )
+        endpoints = _jail_exposure.docker_network_endpoints()
+        if endpoints:
+            parts.append(
+                f"a Docker daemon answers on this host over TCP ({', '.join(endpoints)}): a confined command "
+                "can drive it and escape the sandbox through it. Bind the daemon to a socket this user cannot "
+                "write, or require TLS client certificates, to close this."
+            )
+        abstract = _jail_exposure.dbus_addresses(os.environ.get("DBUS_SESSION_BUS_ADDRESS", ""))[1]
+        if abstract:
+            parts.append(
+                f"the session bus listens on an abstract socket ({', '.join(abstract)}), which has no path for "
+                "the sandbox to deny: a confined command can connect to it and have the bus start processes "
+                "outside the sandbox. Run the bus on a path socket (unix:path=) to close this."
+            )
         skipped = [
             *_skipped(_terminal_server_candidates(), stat.S_ISDIR),
             *_skipped(_named_socket_candidates(), stat.S_ISSOCK),
@@ -213,6 +225,8 @@ class SeatbeltContainmentBackend:
                 "or a link to one), so the sandbox has no rule for them: a server listening there stays "
                 "reachable. Remove them, or point the variable that names them elsewhere, to close this."
             )
+        if _loopback_ssh():
+            parts.append(_jail_exposure.ssh_message("sandbox", "whenever the run allows network access"))
         return " Also: ".join(parts) if parts else None
 
     def _attempt_write(self, profile: str, working_root: Any, target: Path) -> bool:

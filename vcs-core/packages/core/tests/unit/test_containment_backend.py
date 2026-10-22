@@ -17,9 +17,17 @@ import tempfile
 from pathlib import Path
 
 import pytest
+from vcs_core import _jail_exposure
 from vcs_core import _seatbelt_containment as seatbelt
 from vcs_core._containment import ContainmentBackend, JailNotEstablished
 from vcs_core._seatbelt_containment import SeatbeltContainmentBackend, lower_to_seatbelt
+
+
+@pytest.fixture(autouse=True)
+def no_ssh_login(monkeypatch):
+    """exposure() would log in to the test host's sshd; tests/unit/test_jail_exposure.py covers that."""
+    monkeypatch.setattr(_jail_exposure, "_SSH_LOGS_IN", False)
+
 
 _macos = pytest.mark.skipif(
     sys.platform != "darwin",
@@ -302,6 +310,9 @@ def test_seatbelt_refuses_a_connect_to_a_tmux_socket(monkeypatch) -> None:
 def test_seatbelt_reports_docker_reachable(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(seatbelt.Path, "home", staticmethod(lambda: tmp_path))
     monkeypatch.delenv("DOCKER_HOST", raising=False)
+    monkeypatch.setenv("DOCKER_CONFIG", str(tmp_path / "cfg"))
+    monkeypatch.setattr(_jail_exposure, "docker_network_endpoints", list)
+    monkeypatch.setattr(seatbelt, "_loopback_ssh", lambda: False)
     system_sock = Path("/var/run/docker.sock")
     if system_sock.exists() and os.access(system_sock, os.W_OK):
         pytest.skip("this host has a writable /var/run/docker.sock")
@@ -315,3 +326,29 @@ def test_seatbelt_reports_docker_reachable(tmp_path, monkeypatch) -> None:
     assert "docker.sock" in message
     monkeypatch.setenv("DOCKER_HOST", "tcp://127.0.0.1:2375")
     assert "over the network (tcp)" in (backend.exposure() or "")
+
+
+@_macos
+def test_seatbelt_reports_a_docker_context_and_an_ssh_login(tmp_path, monkeypatch) -> None:
+    """The same two ways out Linux reports: a context's socket, and a login to this host's sshd."""
+    monkeypatch.setattr(seatbelt.Path, "home", staticmethod(lambda: tmp_path / "home"))
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+    monkeypatch.setenv("DOCKER_CONFIG", str(tmp_path / "cfg"))
+    monkeypatch.setattr(_jail_exposure, "docker_network_endpoints", list)
+    monkeypatch.setattr(seatbelt, "_loopback_ssh", lambda: False)
+    monkeypatch.setattr(seatbelt, "_skipped", lambda candidates, is_kind: [])
+    system_sock = Path("/var/run/docker.sock")
+    if system_sock.exists() and os.access(system_sock, os.W_OK):
+        pytest.skip("this host has a writable /var/run/docker.sock")
+    backend = SeatbeltContainmentBackend()
+    assert backend.exposure() is None
+    sock = tmp_path / "ctx.sock"
+    sock.write_text("")
+    meta = tmp_path / "cfg" / "contexts" / "meta" / "abc"
+    meta.mkdir(parents=True)
+    meta.joinpath("meta.json").write_text(f'{{"Endpoints": {{"docker": {{"Host": "unix://{sock}"}}}}}}')
+    assert "ctx.sock" in (backend.exposure() or "")
+    meta.joinpath("meta.json").unlink()
+    monkeypatch.setattr(seatbelt, "_loopback_ssh", lambda: True)
+    assert "inside the sandbox runs cmd outside it" in (backend.exposure() or "")

@@ -9,15 +9,18 @@ so they need the privileged image; on macOS they skip.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import shutil
 import socket
 import subprocess
 import sys
+import termios
 from pathlib import Path
 
 import pytest
+from vcs_core import _jail_exposure
 from vcs_core import _landlock_containment as landlock
 from vcs_core._containment import ContainmentBackend, JailNotEstablished
 from vcs_core._landlock_containment import LandlockContainmentBackend, landlock_abi
@@ -26,6 +29,12 @@ pytestmark = [
     pytest.mark.container,
     pytest.mark.skipif(sys.platform != "linux", reason="Landlock is Linux-only"),
 ]
+
+
+@pytest.fixture(autouse=True)
+def no_ssh_login(monkeypatch):
+    """exposure() would log in to the test host's sshd; tests/unit/test_jail_exposure.py covers that."""
+    monkeypatch.setattr(_jail_exposure, "_SSH_LOGS_IN", False)
 
 
 def test_landlock_available_and_protocol_conformant() -> None:
@@ -660,43 +669,117 @@ def test_landlock_reports_a_reachable_x_display(tmp_path, monkeypatch, fresh_hid
     assert "keystrokes" in (landlock.exposure() or "")
 
 
-def test_landlock_reports_ssh_to_loopback_only_when_the_login_succeeds(monkeypatch) -> None:
-    """Keys on disk and an sshd on loopback are not enough: the check logs in and runs `true`."""
-    monkeypatch.setattr(landlock, "_SSH_LOGS_IN", None)
-    monkeypatch.setattr(landlock.shutil, "which", lambda name: "/usr/bin/ssh" if name == "ssh" else None)
-    monkeypatch.setattr(landlock.socket, "create_connection", lambda address, timeout: socket.socket())
-    runs: list[list[str]] = []
+def test_landlock_reports_an_ssh_login_to_this_host(monkeypatch, fresh_hiding) -> None:
+    """The login itself is measured in `_jail_exposure` (tests/unit/test_jail_exposure.py)."""
+    monkeypatch.setattr(landlock, "_hidden_dirs", lambda: ())
+    monkeypatch.setattr(landlock, "_docker_sockets", lambda hidden: ())
+    monkeypatch.setattr(landlock, "_x_displays", lambda: ())
+    monkeypatch.setattr(_jail_exposure, "docker_network_endpoints", list)
+    monkeypatch.setattr(_jail_exposure, "ssh_logs_in", lambda: False)
+    assert landlock.exposure() is None
+    monkeypatch.setattr(_jail_exposure, "ssh_logs_in", lambda: True)
+    assert "logged in to this host's sshd" in (landlock.exposure() or "")
 
-    def login(rc):
-        def run(argv, **kwargs):
-            runs.append(argv)
-            return subprocess.CompletedProcess(argv, rc, b"", b"")
 
-        return run
+def test_landlock_reports_a_docker_context_socket(tmp_path, monkeypatch, fresh_hiding) -> None:
+    """Docker Desktop for Linux reaches its daemon through a context, with no DOCKER_HOST."""
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    monkeypatch.setenv("DOCKER_CONFIG", str(tmp_path / "cfg"))
+    sock_path = tmp_path / "desktop.sock"
+    meta = tmp_path / "cfg" / "contexts" / "meta" / "abc"
+    meta.mkdir(parents=True)
+    meta.joinpath("meta.json").write_text(
+        json.dumps({"Name": "desktop-linux", "Endpoints": {"docker": {"Host": f"unix://{sock_path}"}}})
+    )
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        assert str(sock_path) not in landlock._docker_sockets(())
+        server.bind(str(sock_path))
+        assert os.path.realpath(sock_path) in landlock._docker_sockets(())
+        assert os.path.realpath(sock_path) not in landlock._docker_sockets((str(tmp_path),))  # hidden
+    finally:
+        server.close()
 
-    monkeypatch.setattr(landlock.subprocess, "run", login(255))
-    assert landlock._loopback_ssh() is False  # denied: Permission denied (publickey)
-    argv = runs[0]
-    assert argv[-2:] == ["127.0.0.1", "true"]
-    assert "BatchMode=yes" in argv
-    assert "UserKnownHostsFile=/dev/null" in argv
-    tries = len(runs)
-    assert landlock._loopback_ssh() is False
-    assert len(runs) == tries  # once per process
 
-    monkeypatch.setattr(landlock, "_SSH_LOGS_IN", None)
-    monkeypatch.setattr(landlock.subprocess, "run", login(0))
-    assert landlock._loopback_ssh() is True
-    assert "logged in to sshd" in (landlock.exposure() or "")
+def test_landlock_reports_a_session_bus_on_an_abstract_socket(monkeypatch, fresh_hiding) -> None:
+    """An abstract socket has no file, so no mount hides it."""
+    monkeypatch.setattr(landlock, "_hidden_dirs", lambda: ())
+    monkeypatch.setattr(landlock, "_docker_sockets", lambda hidden: ())
+    monkeypatch.setattr(landlock, "_x_displays", lambda: ())
+    monkeypatch.setattr(landlock, "_loopback_ssh", lambda: False)
+    monkeypatch.setattr(_jail_exposure, "docker_network_endpoints", list)
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:abstract=/tmp/dbus-Xq3,guid=1")
+    assert "abstract socket (/tmp/dbus-Xq3)" in (landlock.exposure() or "")
 
-    def refused(address, timeout):
-        raise ConnectionRefusedError
 
-    monkeypatch.setattr(landlock, "_SSH_LOGS_IN", None)
-    monkeypatch.setattr(landlock.socket, "create_connection", refused)
-    runs.clear()
-    assert landlock._loopback_ssh() is False  # no sshd on loopback: no login tried
-    assert runs == []
+def test_landlock_decodes_a_percent_escaped_bus_path(tmp_path, monkeypatch) -> None:
+    bus = tmp_path / "bus dir~" / "bus"
+    escaped = str(bus).replace(" ", "%20").replace("~", "%7e")
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", f"unix:path={escaped}")
+    monkeypatch.delenv("TMUX", raising=False)
+    assert landlock._named_socket_candidates() == [str(bus)]
+
+
+def test_landlock_hiding_check_fails_in_the_launchers_pid_namespace(tmp_path) -> None:
+    """Outside bubblewrap the check sees its own pid namespace: the property it guards."""
+    spec = landlock._hidden_dirs_spec(())
+    assert json.loads(spec)["pidns"] == str(Path("/proc/self/ns/pid").readlink())
+    done = subprocess.run(
+        [sys.executable, "-c", landlock._HIDDEN_DIRS_CHECK, spec], capture_output=True, text=True, check=False
+    )
+    assert done.returncode == 1
+    assert "pid namespace" in done.stdout
+
+
+def test_landlock_runner_drops_the_controlling_terminal(tmp_path) -> None:
+    """With TIOCSTI allowed, a command holding the launching terminal could type into its shell."""
+    probe = "import os\ntry:\n    os.close(os.open('/dev/tty', os.O_RDONLY))\n    print('tty')\nexcept OSError:\n    print('none')\n"
+    child = "import subprocess, sys; sys.exit(subprocess.call(sys.argv[1:]))"  # so the runner is no session leader
+    runner = [
+        sys.executable,
+        "-m",
+        "vcs_core._landlock_containment",
+        landlock._RUNNER_SENTINEL,
+        json.dumps([str(tmp_path)]),
+    ]
+
+    def run(command: list[str]) -> str:
+        master, slave = os.openpty()
+
+        def own_terminal() -> None:
+            os.setsid()
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+        try:
+            done = subprocess.run(
+                [sys.executable, "-c", child, *command],
+                stdin=slave,
+                capture_output=True,
+                text=True,
+                preexec_fn=own_terminal,
+                check=False,
+                cwd=tmp_path,
+            )
+        finally:
+            os.close(master)
+            os.close(slave)
+        assert done.returncode == 0, done.stderr
+        return done.stdout.strip()
+
+    assert run([sys.executable, "-c", probe]) == "tty"  # control: without the runner it is there
+    assert run([*runner, sys.executable, "-c", probe]) == "none"
+
+
+def test_landlock_imports_without_a_deprecation_warning() -> None:
+    """Python 3.14 deprecates ctypes `_pack_` without `_layout_`; 3.19 makes it an error."""
+    done = subprocess.run(
+        [sys.executable, "-W", "error::DeprecationWarning", "-c", "import vcs_core._landlock_containment"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    assert len(landlock._path_beneath(1, 2).raw) == 12
 
 
 def test_landlock_masks_a_socket_inside_a_bound_back_path(tmp_path, monkeypatch, fresh_hiding) -> None:
