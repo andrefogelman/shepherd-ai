@@ -1018,3 +1018,119 @@ def test_a_launch_warning_survives_an_exposure_that_cannot_be_described(monkeypa
 
     monkeypatch.setattr(landlock, "exposure", broken)
     assert "could not tell what it leaves reachable" in landlock._exposure_warning()
+
+
+def test_landlock_outer_chain_gets_the_kept_environment_and_the_command_its_own(
+    tmp_path, monkeypatch, fresh_hiding
+) -> None:
+    """A caller that put a repository's settings in the live environment after
+    resolve_programs: the outer prefix, bubblewrap and the runner run on the host with the
+    kept environment; only the jailed command sees the repository's values."""
+    backend = LandlockContainmentBackend()
+    profile = backend.profile_for((str(tmp_path),), allow_network=True)
+    monkeypatch.delenv("REPO_MARK", raising=False)
+    monkeypatch.setattr(_jail_exposure, "_ENVIRON", dict(os.environ))  # what resolve_programs keeps
+    monkeypatch.setenv("REPO_MARK", "the repository's")
+    outer = tmp_path.parent / f"outer-env-{os.getpid()}.txt"
+    outer.unlink(missing_ok=True)
+    landlock.set_outer_prefix(["/bin/sh", "-c", 'printf %s "${REPO_MARK-unset}" > "$0" && exec "$@"', str(outer)])
+    inside = tmp_path / "inside.txt"
+    try:
+        done = backend.launch(profile, tmp_path, ["/bin/sh", "-c", 'printf %s "$REPO_MARK" > "$0"', str(inside)])
+        assert done.returncode == 0, done.stderr
+        assert outer.read_text() == "unset"
+        assert inside.read_text() == "the repository's"
+    finally:
+        outer.unlink(missing_ok=True)
+
+
+def test_landlock_command_env_passed_explicitly_reaches_only_the_command(tmp_path, monkeypatch, fresh_hiding) -> None:
+    backend = LandlockContainmentBackend()
+    profile = backend.profile_for((str(tmp_path),), allow_network=True)
+    monkeypatch.setattr(_jail_exposure, "_ENVIRON", dict(os.environ))
+    inside = tmp_path / "inside.txt"
+    env = {**os.environ, "REPO_MARK": "given", "NON_ASCII": "café"}
+    done = backend.launch(
+        profile, tmp_path, ["/bin/sh", "-c", 'printf %s "$REPO_MARK $NON_ASCII" > "$0"', str(inside)], env=env
+    )
+    assert done.returncode == 0, done.stderr
+    assert inside.read_text(encoding="utf-8") == "given café"
+
+
+def test_landlock_one_environment_keeps_the_single_environment_launch(tmp_path, monkeypatch) -> None:
+    """With nothing kept, or nothing changed since, the launch is the one it always was."""
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen["argv"], seen["kwargs"] = argv, kwargs
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(landlock, "_hiding_argv", lambda keep=(): [])
+    monkeypatch.setattr(landlock.subprocess, "run", fake_run)
+    backend = LandlockContainmentBackend()
+    profile = backend.profile_for((str(tmp_path),), allow_network=True)
+    for kept in (None, dict(os.environ)):
+        monkeypatch.setattr(_jail_exposure, "_ENVIRON", kept)
+        backend.launch(profile, tmp_path, ["/bin/true"])
+        assert landlock._RUNNER_SENTINEL in seen["argv"]
+        assert landlock._RUNNER_ENV_FD_SENTINEL not in seen["argv"]
+        assert "pass_fds" not in seen["kwargs"]
+        assert seen["kwargs"]["env"] == dict(os.environ)
+
+
+def test_landlock_closes_the_environment_memfd_after_the_launch(tmp_path, monkeypatch, fresh_hiding) -> None:
+    backend = LandlockContainmentBackend()
+    profile = backend.profile_for((str(tmp_path),), allow_network=True)
+    monkeypatch.setattr(_jail_exposure, "_ENVIRON", {**os.environ, "ONLY_KEPT": "1"})
+    before = sorted(Path("/proc/self/fd").iterdir())
+    assert backend.launch(profile, tmp_path, ["/bin/true"]).returncode == 0
+    assert sorted(Path("/proc/self/fd").iterdir()) == before
+
+
+def test_landlock_runner_refuses_an_environment_it_cannot_read(tmp_path) -> None:
+    """Fail-closed: a bad fd or a payload that is not a mapping of strings runs nothing."""
+    target = tmp_path / "ran.txt"
+    for fd_arg, payload in (("999", None), (None, b'["not", "a mapping"]'), (None, b"{not json")):
+        fd = None
+        if payload is not None:
+            fd = landlock._memfd_create(b"t")
+            os.write(fd, payload)
+            os.lseek(fd, 0, os.SEEK_SET)
+            fd_arg = str(fd)
+        try:
+            done = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-m",
+                    "vcs_core._landlock_containment",
+                    landlock._RUNNER_ENV_FD_SENTINEL,
+                    fd_arg,
+                    json.dumps([str(tmp_path)]),
+                    "/usr/bin/touch",
+                    "--",
+                    str(target),
+                ],
+                pass_fds=(fd,) if fd is not None else (),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        finally:
+            if fd is not None:
+                os.close(fd)
+        assert done.returncode == landlock._CONFINE_FAILED_RC, (fd_arg, done.stderr)
+        assert not target.exists()
+
+
+def test_landlock_finds_memfd_create_in_libc_when_python_lacks_it(tmp_path, monkeypatch, fresh_hiding) -> None:
+    """python-build-standalone CPython is built without os.memfd_create."""
+    monkeypatch.delattr(os, "memfd_create", raising=False)
+    backend = LandlockContainmentBackend()
+    profile = backend.profile_for((str(tmp_path),), allow_network=True)
+    monkeypatch.setattr(_jail_exposure, "_ENVIRON", dict(os.environ))
+    inside = tmp_path / "inside.txt"
+    env = {**os.environ, "REPO_MARK": "via libc"}
+    done = backend.launch(profile, tmp_path, ["/bin/sh", "-c", 'printf %s "$REPO_MARK" > "$0"', str(inside)], env=env)
+    assert done.returncode == 0, done.stderr
+    assert inside.read_text() == "via libc"

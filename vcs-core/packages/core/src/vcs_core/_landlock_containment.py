@@ -99,6 +99,9 @@ class JailExposureWarning(RuntimeWarning):
 
 
 _RUNNER_SENTINEL = "__landlock_confine_exec__"
+# argv = [this, fd, roots_json, *command]: the command's environment arrives on fd, not in
+# the runner's own (see `launch`)
+_RUNNER_ENV_FD_SENTINEL = "__landlock_confine_exec_env_fd__"
 _CONFINE_FAILED_RC = 3  # runner exit code when confinement could not be established (touch never uses 3)
 
 _LIBC = ctypes.CDLL(None, use_errno=True)
@@ -642,6 +645,64 @@ def _hiding_argv(keep: Sequence[str] = ()) -> list[str]:
     return _bwrap_argv(bwrap, dirs, keep)
 
 
+_MFD_CLOEXEC = 1
+
+
+def _memfd_create(name: bytes) -> int:
+    """Return os.memfd_create, else glibc's (2.27+).
+
+    Some CPython builds (python-build-standalone, which uv installs) are compiled without
+    the os function on a kernel and libc that have it.
+    """
+    if hasattr(os, "memfd_create"):
+        return os.memfd_create(name.decode())
+    create = getattr(_LIBC, "memfd_create", None)
+    if create is None:
+        raise OSError("memfd_create is not available")
+    create.restype = ctypes.c_int
+    create.argtypes = (ctypes.c_char_p, ctypes.c_uint)
+    fd = int(create(name, _MFD_CLOEXEC))
+    if fd < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    return fd
+
+
+def _env_memfd(environment: dict[str, str]) -> int:
+    """A memfd holding ``environment`` as JSON, rewound for the runner to read.
+
+    In memory only: the environment may carry credentials, and a file on disk would
+    outlive a launch that died before the runner removed it.
+    """
+    data = json.dumps(environment).encode("ascii")  # non-ASCII and surrogates are \\u-escaped
+    fd = _memfd_create(b"vcs-core-command-env")
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view) :]
+        os.lseek(fd, 0, os.SEEK_SET)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _read_env_fd(fd: int) -> dict[str, str]:
+    """The environment `_env_memfd` wrote, read to the end; the fd is closed either way."""
+    chunks = []
+    try:
+        while chunk := os.read(fd, 1 << 16):
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+    environment = json.loads(b"".join(chunks))
+    if not isinstance(environment, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in environment.items()
+    ):
+        raise ValueError("the command's environment is not a mapping of strings")
+    return environment
+
+
 class LandlockContainmentBackend:
     """Linux Landlock jail (unprivileged LSM). Native syscall-deny, no container."""
 
@@ -684,28 +745,50 @@ class LandlockContainmentBackend:
         hiding the command servers' sockets (where one exists and bubblewrap works), the
         runner, the command. The probe passes ``outer=False``: its launches only touch a
         file, and a wrapper failing there would read as a denied write.
+
+        Everything before the command runs on the host, so it gets the environment
+        `_jail_exposure.resolve_programs` kept, not the command's: a caller that put a
+        repository's settings in the live environment for the jailed command does not
+        hand them to the outer prefix, bubblewrap or the runner. The command's own
+        environment then travels on a memfd the runner reads before it confines itself.
+        When the two are the same (no environment kept, or nothing changed since) the
+        launch is the single-environment one it always was.
         """
         cwd = os.path.realpath(str(working_root))
-        return subprocess.run(
-            [
-                *(_OUTER_PREFIX if outer else ()),
-                *_hiding_argv((cwd, *json.loads(profile or "[]"))),
-                sys.executable,
-                # -I: no PYTHON* variable, user site or working directory decides what the
-                # runner imports; it runs on the host before Landlock confines anything
-                "-I",
-                "-m",
-                "vcs_core._landlock_containment",
-                _RUNNER_SENTINEL,
-                profile,
-                *command,
-            ],
-            cwd=cwd,
-            env=env if env is not None else dict(os.environ),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        command_env = env if env is not None else dict(os.environ)
+        host_env = dict(_jail_exposure.environ())
+        chain = [
+            *(_OUTER_PREFIX if outer else ()),
+            *_hiding_argv((cwd, *json.loads(profile or "[]"))),
+            sys.executable,
+            # -I: no PYTHON* variable, user site or working directory decides what the
+            # runner imports; it runs on the host before Landlock confines anything
+            "-I",
+            "-m",
+            "vcs_core._landlock_containment",
+        ]
+        if host_env == command_env:
+            return subprocess.run(
+                [*chain, _RUNNER_SENTINEL, profile, *command],
+                cwd=cwd,
+                env=command_env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        fd = _env_memfd(command_env)
+        try:
+            return subprocess.run(
+                [*chain, _RUNNER_ENV_FD_SENTINEL, str(fd), profile, *command],
+                cwd=cwd,
+                env=host_env,
+                pass_fds=(fd,),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        finally:
+            os.close(fd)
 
     def _write_result(self, profile: str, working_root: Any, target: Path) -> int:
         """Confined ``touch target``; return the runner rc: 0=allowed, 3=confine-failed, else denied.
@@ -811,14 +894,15 @@ def _drop_controlling_terminal() -> None:
         os.close(tty)
 
 
-def _run_confined() -> int:
-    """Runner entry: argv = [SENTINEL, roots_json, *command]. Confine self, then exec command.
+def _run_confined(args: list[str], environment: dict[str, str] | None = None) -> int:
+    """Runner entry: args = [roots_json, *command]. Confine self, then exec command.
 
     ``roots_json`` is the backend-private profile: a JSON array of writable roots (``[]`` =
     ReadOnly). JSON keeps the whole set in one argv element and is safe for arbitrary paths.
+    ``environment``, when given, replaces the runner's own for the command (see `launch`).
     """
-    writable_roots = json.loads(sys.argv[2]) if sys.argv[2] else []
-    command = sys.argv[3:]
+    writable_roots = json.loads(args[0]) if args[0] else []
+    command = args[1:]
     try:
         landlock_confine(writable_roots)
     except OSError:
@@ -826,10 +910,24 @@ def _run_confined() -> int:
     _drop_controlling_terminal()
     if not command:
         return 0
+    if environment is not None:
+        # PATH of the command's environment chooses the program, as execvp did with it inherited
+        os.execvpe(command[0], command, environment)  # noqa: S606  intentional shell-free exec
     os.execvp(command[0], command)  # noqa: S606  intentional shell-free exec (the confined runner)
     return 127  # type: ignore[unreachable]  # os.execvp replaces the process or raises; never returns
 
 
+def _run_confined_with_env_fd() -> int:
+    """Runner entry: argv = [ENV_FD_SENTINEL, fd, roots_json, *command]."""
+    try:
+        environment = _read_env_fd(int(sys.argv[2]))
+    except (OSError, ValueError):
+        return _CONFINE_FAILED_RC  # fail-closed: never run the body with an environment it was not given
+    return _run_confined(sys.argv[3:], environment)
+
+
 if __name__ == "__main__":
     if len(sys.argv) >= 2 and sys.argv[1] == _RUNNER_SENTINEL:
-        raise SystemExit(_run_confined())
+        raise SystemExit(_run_confined(sys.argv[2:]))
+    if len(sys.argv) >= 3 and sys.argv[1] == _RUNNER_ENV_FD_SENTINEL:
+        raise SystemExit(_run_confined_with_env_fd())
